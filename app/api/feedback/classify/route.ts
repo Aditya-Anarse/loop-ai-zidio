@@ -1,0 +1,128 @@
+import { NextResponse } from "next/server";
+import { requireApiWorkspaceContext, ApiAuthError, ApiForbiddenError } from "@/services/auth/authorization";
+import { AiService } from "@/lib/services/ai-service";
+import { DbService } from "@/lib/services/db-service";
+import { prisma } from "@/lib/prisma";
+
+export async function POST(request: Request) {
+  try {
+    // 1. Enforce Server-Side Auth/Tenant Isolation
+    const { workspaceId, role } = await requireApiWorkspaceContext();
+
+    if (role === "VIEWER") {
+      return NextResponse.json(
+        { success: false, message: "Permission Denied: Read-only access." },
+        { status: 403 }
+      );
+    }
+
+    const body = await request.json();
+    const { content, source, customerName, customerEmail, customerLabel } = body;
+
+    if (!content || !source) {
+      return NextResponse.json(
+        { error: "Content and source are required fields." },
+        { status: 400 }
+      );
+    }
+
+    // 2. Deduplication: Reuse classification results for identical content in workspace
+    const duplicate = await prisma.feedback.findFirst({
+      where: {
+        workspaceId,
+        content: { equals: content.trim(), mode: "insensitive" },
+        sentiment: { not: null },
+      },
+      select: {
+        sentiment: true,
+        metadata: true,
+      },
+    });
+
+    let classification;
+    let reused = false;
+
+    if (duplicate) {
+      const dupMeta = duplicate.metadata as Record<string, any>;
+      classification = {
+        sentiment: duplicate.sentiment,
+        score: dupMeta.score || 5,
+        theme: dupMeta.theme || "General Feedback",
+        area: dupMeta.area || "General",
+        summary: dupMeta.summary || "Reused classification.",
+        priority: dupMeta.priority || "MEDIUM",
+        confidence: dupMeta.confidence || 0.95,
+        promptVersion: dupMeta.promptVersion || "v1.1",
+        modelVersion: dupMeta.modelVersion || "reused-dedup",
+      };
+      reused = true;
+    } else {
+      classification = await AiService.classifyFeedback(content);
+    }
+
+    // 3. Save to database scoped to workspaceId
+    const feedback = await DbService.ingestFeedback(
+      workspaceId,
+      {
+        content,
+        source,
+        customerName,
+        customerEmail,
+        customerLabel,
+        sentiment: classification.sentiment as any,
+        score: classification.score,
+        theme: classification.theme,
+        area: classification.area,
+        priority: classification.priority,
+        confidence: classification.confidence,
+        promptVersion: classification.promptVersion,
+        modelVersion: classification.modelVersion,
+      },
+      reused ? "System Ingestion (Deduplicated)" : "System Ingestion"
+    );
+
+    return NextResponse.json({ success: true, feedback }, { status: 201 });
+  } catch (error: any) {
+    if (error instanceof ApiAuthError) {
+      console.warn(
+        JSON.stringify({
+          event: "API_AUTH_FAILURE",
+          api: "POST /api/feedback/classify",
+          message: error.message,
+          timestamp: new Date().toISOString(),
+        })
+      );
+      return NextResponse.json(
+        { success: false, message: "Unauthorized", data: null, errors: ["UNAUTHORIZED"] },
+        { status: 401 }
+      );
+    }
+    if (error instanceof ApiForbiddenError) {
+      console.warn(
+        JSON.stringify({
+          event: "API_FORBIDDEN_FAILURE",
+          api: "POST /api/feedback/classify",
+          message: error.message,
+          timestamp: new Date().toISOString(),
+        })
+      );
+      return NextResponse.json(
+        { success: false, message: "Forbidden", data: null, errors: ["FORBIDDEN"] },
+        { status: 403 }
+      );
+    }
+    console.error(
+      JSON.stringify({
+        event: "API_ERROR",
+        api: "POST /api/feedback/classify",
+        error: error.message || error,
+        timestamp: new Date().toISOString(),
+      })
+    );
+    return NextResponse.json(
+      { error: error.message || "An unexpected error occurred." },
+      { status: 500 }
+    );
+  }
+}
+
