@@ -231,26 +231,36 @@ AI operations are divided into four primary tasks powered by **Google Gemini API
 
 ## Deployment Guide & Environment Variables
 
-### Environment Variables
-Configure the following parameters in a `.env` file at the root level. Do not prefix server-only keys with `NEXT_PUBLIC_` to prevent exposure.
+### Required Environment Variables
 
-```ini
-# Database Connection
-DATABASE_URL="postgresql://[USER]:[PASSWORD]@[HOST]/[DATABASE]?sslmode=require"
+To successfully run LOOP (either locally or in a production Vercel environment), you must configure the following 4 environment variables:
 
-# NextAuth Settings
-NEXTAUTH_SECRET="your-nextauth-secret-key"
-NEXTAUTH_URL="http://localhost:3000"
+| Variable Name | Required | Description | Example (Local Dev) | Example (Vercel Prod) |
+| :--- | :--- | :--- | :--- | :--- |
+| **`DATABASE_URL`** | Yes | PostgreSQL connection string (prefer Neon serverless). | `postgresql://user:pass@host/db?sslmode=require` | `postgresql://user:pass@host-prod/db?sslmode=require` |
+| **`NEXTAUTH_SECRET`** | Yes | Cryptographically secure secret string used to hash JWTs and cookies. | `your-secret-base64` | `production-only-high-entropy-hash` |
+| **`NEXTAUTH_URL`** | Yes | Canonical root URL of the platform. **Must be production domain on Vercel**. | `http://localhost:3000` | `https://loop-ai.vercel.app` (do not use localhost in production) |
+| **`GEMINI_API_KEY`** | Yes | Google Gemini API key for running classification and Q&A. | `AIzaSy-mock-local-key` | `AIzaSy-production-key` |
 
-# AI Configuration
-GEMINI_API_KEY="AIzaSy..."
-```
+---
 
-### Steps to Deploy on Vercel
-1. Create a new project on the Vercel dashboard and connect your repository.
-2. In the project settings, add the environment variables listed above.
-3. Configure the build settings to default values. Vercel automatically runs `npm run build` which triggers the `postinstall` script to generate the Prisma client (`prisma generate`), ensuring typescript definitions are available.
-4. Run database migrations to prepare your production database:
+### Local Deployment
+1. Create a file named `.env` in the root of the workspace.
+2. Copy the structure above and assign appropriate values.
+3. Start the dev server:
+   ```bash
+   npm run dev
+   ```
+
+---
+
+### Vercel Production Deployment
+1. **Connect Repository**: Import this repository into your Vercel Dashboard.
+2. **Configure Environment Variables**: Under Project Settings &rarr; **Environment Variables**, add the four variables listed above.
+   > [!IMPORTANT]
+   > On Vercel, `NEXTAUTH_URL` must point to your canonical deployment domain (e.g., `https://your-project.vercel.app`). Using `localhost` or `127.0.0.1` will block the application startup with a configuration warning screen.
+3. **Build & Deploy**: Trigger a deployment. Vercel will build the project and execute `prisma generate` to configure the database client automatically.
+4. **Deploy Database Migrations**: Run the database migrations in production to synchronize schemas:
    ```bash
    npx prisma migrate deploy
    ```

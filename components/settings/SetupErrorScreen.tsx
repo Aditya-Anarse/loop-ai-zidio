@@ -8,13 +8,23 @@ type EnvVarStatus = {
   source: string;
 };
 
-export default function SetupErrorScreen({ missingVars }: { missingVars: string[] }) {
+export default function SetupErrorScreen({
+  missingVars,
+  isVercel = false,
+  isLocalhostNextAuth = false,
+}: {
+  missingVars: string[];
+  isVercel?: boolean;
+  isLocalhostNextAuth?: boolean;
+}) {
   const envVars: EnvVarStatus[] = [
     {
       name: "DATABASE_URL",
       isConfigured: !missingVars.includes("DATABASE_URL"),
       description: "PostgreSQL connection string (prefer Neon).",
-      source: "Neon Console → Project Settings → Connection String",
+      source: isVercel
+        ? "Add to Vercel Environment Variables as a secure connection string."
+        : "Neon Console → Project Settings → Connection String",
     },
     {
       name: "NEXTAUTH_SECRET",
@@ -25,8 +35,12 @@ export default function SetupErrorScreen({ missingVars }: { missingVars: string[
     {
       name: "NEXTAUTH_URL",
       isConfigured: !missingVars.includes("NEXTAUTH_URL"),
-      description: "Root URL for routing login redirects (typically http://localhost:3000).",
-      source: "Manually set to http://localhost:3000 in local dev.",
+      description: isVercel && isLocalhostNextAuth
+        ? "Root URL for routing login redirects (cannot be set to localhost on Vercel)."
+        : "Root URL for routing login redirects (typically http://localhost:3000).",
+      source: isVercel
+        ? "Set this to your Vercel deployment URL (e.g. https://your-project.vercel.app)."
+        : "Manually set to http://localhost:3000 in local dev.",
     },
     {
       name: "GEMINI_API_KEY",
@@ -48,7 +62,9 @@ export default function SetupErrorScreen({ missingVars }: { missingVars: string[
               Platform Configuration Required
             </h1>
             <p className="text-sm text-slate-500 dark:text-slate-400">
-              Complete your environment variables setup to launch LOOP.
+              {isVercel
+                ? "Complete your production environment variable settings on Vercel."
+                : "Complete your environment variables setup to launch LOOP."}
             </p>
           </div>
         </div>
@@ -65,11 +81,11 @@ export default function SetupErrorScreen({ missingVars }: { missingVars: string[
             >
               <div className="mt-0.5">
                 {item.isConfigured ? (
-                  <span className="flex h-5.5 w-5.5 items-center justify-center rounded-full bg-emerald-100 text-emerald-700 dark:bg-emerald-950 dark:text-emerald-400">
+                  <span className="flex h-5.5 w-5.5 items-center justify-center rounded-full bg-emerald-100 text-emerald-700 dark:bg-emerald-950 dark:text-emerald-400 font-bold">
                     ✓
                   </span>
                 ) : (
-                  <span className="flex h-5.5 w-5.5 items-center justify-center rounded-full bg-rose-100 text-rose-700 dark:bg-rose-950 dark:text-rose-400">
+                  <span className="flex h-5.5 w-5.5 items-center justify-center rounded-full bg-rose-100 text-rose-700 dark:bg-rose-950 dark:text-rose-400 font-bold">
                     !
                   </span>
                 )}
@@ -93,7 +109,7 @@ export default function SetupErrorScreen({ missingVars }: { missingVars: string[
                   {item.description}
                 </p>
                 <div className="mt-2 text-xs font-mono text-slate-500 dark:text-slate-500">
-                  <span className="font-semibold">Source: </span> {item.source}
+                  <span className="font-semibold text-slate-400">Source: </span> {item.source}
                 </div>
               </div>
             </div>
@@ -104,11 +120,20 @@ export default function SetupErrorScreen({ missingVars }: { missingVars: string[
           <h4 className="text-sm font-semibold text-slate-800 dark:text-slate-200">
             How to configure:
           </h4>
-          <ol className="mt-2 list-decimal pl-4 text-xs text-slate-600 dark:text-slate-400 space-y-1">
-            <li>Create a new file named <code className="font-mono bg-slate-100 px-1 py-0.5 rounded text-rose-600 dark:bg-slate-900">.env</code> in your root directory.</li>
-            <li>Copy the keys above and supply the corresponding values.</li>
-            <li>Restart your development server (<code className="font-mono bg-slate-100 px-1 py-0.5 rounded dark:bg-slate-900">npm run dev</code>).</li>
-          </ol>
+          {isVercel ? (
+            <ol className="mt-2 list-decimal pl-4 text-xs text-slate-600 dark:text-slate-400 space-y-1">
+              <li>Open your <strong>Vercel Dashboard</strong> and navigate to this project.</li>
+              <li>Go to <strong>Settings</strong> &rarr; <strong>Environment Variables</strong> in the left panel.</li>
+              <li>Add the missing keys and input their respective production values.</li>
+              <li>Navigate to <strong>Deployments</strong>, click the options menu on your latest build, and select <strong>Redeploy</strong> to apply the new settings.</li>
+            </ol>
+          ) : (
+            <ol className="mt-2 list-decimal pl-4 text-xs text-slate-600 dark:text-slate-400 space-y-1">
+              <li>Create a new file named <code className="font-mono bg-slate-100 px-1 py-0.5 rounded text-rose-600 dark:bg-slate-900">.env</code> in your root directory.</li>
+              <li>Copy the keys above and supply the corresponding values.</li>
+              <li>Restart your development server (<code className="font-mono bg-slate-100 px-1 py-0.5 rounded dark:bg-slate-900">npm run dev</code>).</li>
+            </ol>
+          )}
         </div>
       </div>
     </div>
