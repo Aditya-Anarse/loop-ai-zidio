@@ -54,6 +54,10 @@ export async function POST(request: Request) {
         confidence: dupMeta.confidence || 0.95,
         promptVersion: dupMeta.promptVersion || "v1.1",
         modelVersion: dupMeta.modelVersion || "reused-dedup",
+        severity: dupMeta.severity || "MEDIUM",
+        themes: dupMeta.themes || [dupMeta.theme || "General Feedback"],
+        processingTime: dupMeta.processingTime || 0,
+        provider: dupMeta.provider || "Google",
       };
       reused = true;
     } else {
@@ -77,6 +81,11 @@ export async function POST(request: Request) {
         confidence: classification.confidence,
         promptVersion: classification.promptVersion,
         modelVersion: classification.modelVersion,
+        severity: classification.severity,
+        themes: classification.themes,
+        summary: classification.summary,
+        processingTime: classification.processingTime,
+        provider: classification.provider,
       },
       reused ? "System Ingestion (Deduplicated)" : "System Ingestion"
     );

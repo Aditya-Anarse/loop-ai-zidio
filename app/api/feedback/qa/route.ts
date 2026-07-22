@@ -53,7 +53,7 @@ export async function POST(request: Request) {
       })
     );
 
-    // 3. Feed retrieved items as context to Claude for grounded answer
+    // 3. Feed retrieved items as context to Gemini AI for grounded answer
     const answer = await AiService.groundedQnA(query, retrievedFeedbacks);
 
     return NextResponse.json({

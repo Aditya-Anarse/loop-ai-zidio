@@ -4,18 +4,24 @@ import { Sentiment } from "@prisma/client";
 
 // Validate auto-classification output schema
 export const classificationSchema = z.object({
-  sentiment: z.enum(["POSITIVE", "NEUTRAL", "NEGATIVE", "MIXED"]),
-  score: z.number().min(0).max(10),
-  theme: z.string().min(1).max(100),
-  area: z.string().min(1).max(100),
-  summary: z.string().min(5).max(300),
-  priority: z.enum(["HIGH", "MEDIUM", "LOW"]).default("MEDIUM"),
-  confidence: z.number().min(0.0).max(1.0).default(0.85),
+  sentiment: z.enum(["POSITIVE", "NEUTRAL", "NEGATIVE"]),
+  severity: z.enum(["LOW", "MEDIUM", "HIGH", "CRITICAL"]),
+  confidence: z.number().int().min(0).max(100),
+  summary: z.string().min(1).max(300),
+  themes: z.array(z.string().min(1)),
 });
 
 export type AutoClassificationResult = z.infer<typeof classificationSchema> & {
   promptVersion: string;
   modelVersion: string;
+  processingTime: number;
+  provider: string;
+  
+  // Compatibility fields
+  score: number;
+  theme: string;
+  area: string;
+  priority: "LOW" | "MEDIUM" | "HIGH";
 };
 
 export class AiService {
@@ -30,15 +36,25 @@ export class AiService {
   /**
    * Resilient wrapper to execute API calls with exponential backoff retries
    */
-  private static async withRetry<T>(fn: () => Promise<T>, retries = 3, delay = 1000): Promise<T> {
+  private static async withRetry<T>(fn: () => Promise<T>, retries = 4, delay = 2000): Promise<T> {
     try {
       return await fn();
-    } catch (error) {
+    } catch (error: any) {
       if (retries <= 0) throw error;
-      console.warn(`[AI API Retry] Transient error encountered. Retrying in ${delay}ms... Attempts remaining: ${retries}`, error);
-      await new Promise((resolve) => setTimeout(resolve, delay));
-      return this.withRetry(fn, retries - 1, delay * 2);
+      const isRateLimit = error?.status === 429 || (error?.message && String(error.message).includes("429"));
+      const waitTime = isRateLimit ? Math.max(delay, 8000) : delay;
+      console.warn(`[AI API Retry] ${isRateLimit ? "Rate limit (429)" : "Transient error"} encountered. Retrying in ${waitTime}ms... Attempts remaining: ${retries}`);
+      await new Promise((resolve) => setTimeout(resolve, waitTime));
+      return this.withRetry(fn, retries - 1, isRateLimit ? waitTime + 2000 : delay * 2);
     }
+  }
+
+  private static cleanJsonString(str: string): string {
+    let cleaned = str.trim();
+    if (cleaned.startsWith("```")) {
+      cleaned = cleaned.replace(/^```json\s*/i, "").replace(/```$/, "").trim();
+    }
+    return cleaned;
   }
 
   /**
@@ -46,59 +62,96 @@ export class AiService {
    */
   static async classifyFeedback(text: string): Promise<AutoClassificationResult> {
     const ai = this.getClient();
-    const promptVersion = "v1.1";
-    const modelVersion = "gemini-2.0-flash";
+    const promptVersion = "v2.1";
+    const modelVersion = "gemini-2.5-flash";
 
-    const prompt = `You are an expert customer feedback analyzer. 
-Analyze this customer feedback and categorize it.
-Feedback: "${text}"
+    const prompt = `Classify customer feedback sentiment, severity, confidence (0-100), themes, and summary as JSON.
 
-You MUST respond ONLY with a raw JSON object containing these keys:
-- sentiment: must be one of "POSITIVE", "NEUTRAL", "NEGATIVE", "MIXED"
-- score: a number between 0 and 10 representing customer happiness (0=furious, 10=ecstatic)
-- theme: a single short noun phrase categorizing the topic (e.g. "Checkout Speed", "Search Accuracy", "SSO Authentication", "NPS Survey")
-- area: the general application module/feature area (e.g. "Performance", "Authentication", "UI/UX", "Billing", "Search", "Support")
-- summary: a one-sentence summary of the main core concern of this feedback (max 200 chars)
-- priority: a priority level of "HIGH", "MEDIUM", or "LOW" based on severity/impact (e.g., billing bugs, logins failures, and churn threats are "HIGH"; minor layout alignment or formatting suggestions are "LOW")
-- confidence: a confidence rating of your evaluation as a float between 0.0 and 1.0
+Text: "${text}"
 
-Your response must be a single parseable JSON block, with no explanation, markdown formatting, or HTML tags.`;
+STRICT RULES:
+- SENTIMENT (MUST be exactly POSITIVE, NEUTRAL, or NEGATIVE):
+  - POSITIVE: Praise, satisfaction, compliments, fast performance, accurate insights, or resolved issues (e.g. "issue was resolved within minutes", "accurate and very helpful", "detailed and easy to understand", "excellent support").
+  - NEGATIVE: Complaints, bugs, crashes, failures, slowness, freezing, unresponsive support, or frustration (e.g. "login keeps failing", "takes too long to load", "search is not returning expected results", "interface freezes frequently", "customer support did not respond").
+  - NEUTRAL: Factual statements, routine updates, feature requests, or mild observations without emotion (e.g. "no major issues so far", "CSV upload completed", "would like more filters").
+- SEVERITY: LOW (praise/ideas), MEDIUM (workflow/requests), HIGH (login/slowness/unresponsive/negative), CRITICAL (crashes/freezing/outages).
+- CONFIDENCE: Integer 80-100 for clear text.
+- THEMES: Array of 1-2 concise topic strings (e.g. ["Support"], ["Performance"], ["UI"], ["Authentication"]).
+- SUMMARY: One concise sentence.
 
-    try {
-      const response = await this.withRetry(() =>
-        ai.models.generateContent({
-          model: modelVersion,
-          contents: prompt,
-          config: {
-            responseMimeType: "application/json",
-          },
-        })
-      );
+JSON SCHEMA ONLY (no markdown formatting, no code fences):
+{"sentiment":"POSITIVE"|"NEUTRAL"|"NEGATIVE","severity":"LOW"|"MEDIUM"|"HIGH"|"CRITICAL","confidence":95,"summary":"concise summary","themes":["Theme"]}`;
 
-      const jsonStr = response.text ? response.text.trim() : "";
-      const parsed = JSON.parse(jsonStr);
-      const validated = classificationSchema.parse(parsed);
+    let attempts = 0;
+    const maxAttempts = 3;
+    let lastError: any = null;
 
-      return {
-        ...validated,
-        promptVersion,
-        modelVersion,
-      };
-    } catch (e) {
-      console.error("AI feedback classification failure:", e);
-      // Fail-safe defaults matching schema
-      return {
-        sentiment: "NEUTRAL",
-        score: 5,
-        theme: "General Feedback",
-        area: "General",
-        summary: "Customer left comment regarding platform options.",
-        priority: "MEDIUM",
-        confidence: 0.5,
-        promptVersion,
-        modelVersion,
-      };
+    while (attempts < maxAttempts) {
+      attempts++;
+      const startTime = Date.now();
+      try {
+        console.log(`[AiService] Classification attempt ${attempts}/${maxAttempts} for text: "${text.slice(0, 50)}..."`);
+        console.log(`[AiService] Prompt sent to Gemini:\n${prompt}`);
+
+        const response = await this.withRetry(
+          () =>
+            ai.models.generateContent({
+              model: modelVersion,
+              contents: prompt,
+              config: {
+                responseMimeType: "application/json",
+                temperature: 0.0, // Strict zero-temperature deterministic classification
+              },
+            }),
+          3,
+          3000
+        );
+
+        const processingTime = Date.now() - startTime;
+        const rawText = response.text ? response.text.trim() : "";
+        console.log(`[AiService] Raw Gemini response (attempt ${attempts}):\n${rawText}`);
+
+        const jsonText = this.cleanJsonString(rawText);
+        let parsed: any;
+        try {
+          parsed = JSON.parse(jsonText);
+        } catch (jsonErr: any) {
+          console.error(`[AiService] JSON Parse Error (attempt ${attempts}):`, jsonErr.message);
+          throw new Error(`JSON parsing failed: ${jsonErr.message}. Raw text: ${rawText}`);
+        }
+
+        console.log(`[AiService] Parsed JSON object (attempt ${attempts}):`, parsed);
+        const validated = classificationSchema.parse(parsed);
+        console.log(`[AiService] Validated Output (attempt ${attempts}):`, validated);
+
+        // Derive compatibility fields
+        const priority = validated.severity === "CRITICAL" || validated.severity === "HIGH" ? "HIGH" : (validated.severity === "LOW" ? "LOW" : "MEDIUM");
+        const score = validated.sentiment === "POSITIVE" ? 9 : (validated.sentiment === "NEGATIVE" ? 2 : 5);
+        const theme = validated.themes[0] || "General Feedback";
+        const area = validated.themes[0] || "General";
+
+        return {
+          ...validated,
+          promptVersion,
+          modelVersion,
+          processingTime,
+          provider: "Google Gemini AI",
+          score,
+          theme,
+          area,
+          priority,
+        };
+      } catch (err: any) {
+        lastError = err;
+        console.error(`[AiService] Classification attempt ${attempts}/${maxAttempts} failed:`, err?.message || err);
+        if (attempts < maxAttempts) {
+          await new Promise((resolve) => setTimeout(resolve, 2000 * attempts));
+        }
+      }
     }
+
+    // Never silently fall back to NEUTRAL or default values when AI fails. Return an explicit error instead.
+    throw new Error(`Gemini AI sentiment classification failed after ${maxAttempts} attempts: ${lastError?.message || "Invalid AI response."}`);
   }
 
   /**

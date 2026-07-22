@@ -23,7 +23,7 @@ type ReportItem = {
   createdAt: string;
 };
 
-// Simple helper to format Claude's markdown reports without requiring react-markdown
+// Simple helper to format synthesized markdown reports without requiring react-markdown
 function formatMarkdown(text: string) {
   if (!text) return "";
   return text
@@ -45,8 +45,13 @@ function formatMarkdown(text: string) {
     .join("");
 }
 
+import { useSearchParams } from "next/navigation";
+
 export default function ReportsPage() {
   const queryClient = useQueryClient();
+  const searchParams = useSearchParams();
+  const reportParamId = searchParams?.get("id") || "";
+
   const { data: session } = useSession();
   const userRole = session?.user?.role || "VIEWER";
   const isReadOnly = userRole === "VIEWER";
@@ -56,9 +61,16 @@ export default function ReportsPage() {
   const [qaAnswer, setQaAnswer] = React.useState("");
   const [qaSources, setQaSources] = React.useState<any[]>([]);
   const [isQaSearching, setIsQaSearching] = React.useState(false);
+  const [qaTime, setQaTime] = React.useState<number | null>(null);
 
   // Selected Report State
-  const [selectedReportId, setSelectedReportId] = React.useState<string | null>(null);
+  const [selectedReportId, setSelectedReportId] = React.useState<string | null>(reportParamId || null);
+
+  React.useEffect(() => {
+    if (reportParamId) {
+      setSelectedReportId(reportParamId);
+    }
+  }, [reportParamId]);
 
   // Query: Get all VoC reports
   const { data, isLoading: reportsLoading } = useQuery({
@@ -100,6 +112,8 @@ export default function ReportsPage() {
     setIsQaSearching(true);
     setQaAnswer("");
     setQaSources([]);
+    setQaTime(null);
+    const start = Date.now();
 
     try {
       const res = await fetch("/api/feedback/qa", {
@@ -111,6 +125,7 @@ export default function ReportsPage() {
       const result = await res.json();
       setQaAnswer(result.answer || "No answer generated.");
       setQaSources(result.sources || []);
+      setQaTime(Date.now() - start);
     } catch (err: any) {
       setQaAnswer(err.message || "An error occurred during search.");
     } finally {
@@ -186,10 +201,17 @@ export default function ReportsPage() {
               </div>
             ) : (
               <div className="space-y-4">
-                <div className="rounded-xl bg-slate-50/50 dark:bg-slate-900/40 p-4 border dark:border-slate-800">
-                  <span className="text-[10px] font-bold uppercase tracking-wider text-blue-600 dark:text-blue-400 block mb-2">
-                    LOOP AI Telemetry Answer
-                  </span>
+                <div className="rounded-xl bg-slate-50/50 dark:bg-slate-900/40 p-4 border dark:border-slate-800 space-y-2">
+                  <div className="flex items-center justify-between">
+                    <span className="text-[10px] font-bold uppercase tracking-wider text-blue-600 dark:text-blue-400">
+                      LOOP AI Telemetry Answer
+                    </span>
+                    {qaTime && (
+                      <span className="text-[9px] font-medium text-slate-400 dark:text-slate-500 bg-slate-100 dark:bg-slate-800 px-2 py-0.5 rounded-full">
+                        Model: Gemini 2.5 Flash • Provider: Google • Latency: {qaTime}ms
+                      </span>
+                    )}
+                  </div>
                   <p className="text-xs text-slate-700 leading-relaxed dark:text-slate-200 whitespace-pre-line">
                     {qaAnswer}
                   </p>

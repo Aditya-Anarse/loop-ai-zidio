@@ -187,7 +187,7 @@ export default async function AppPage() {
             <PieChart
               data={priorityBreakdown}
               title="Priority distribution"
-              description="Feedback severity tier distribution analyzed by Claude AI"
+              description="Feedback severity tier distribution analyzed by Gemini AI"
               tooltipLabel="Severity Share"
               valueSuffix="%"
             />

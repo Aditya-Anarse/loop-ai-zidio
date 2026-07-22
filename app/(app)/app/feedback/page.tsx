@@ -3,7 +3,9 @@
 import * as React from "react";
 import { useQuery, useMutation, useQueryClient } from "@tanstack/react-query";
 import { useSession } from "next-auth/react";
+import { useSearchParams } from "next/navigation";
 import { useDebounce } from "@/hooks/use-debounce";
+import { HighlightMatch } from "@/components/search/HighlightMatch";
 import { motion, AnimatePresence } from "framer-motion";
 import {
   Inbox,
@@ -31,6 +33,7 @@ import {
   X,
   XCircle,
   Cpu,
+  CheckSquare,
 } from "lucide-react";
 import { Card, CardHeader, CardTitle, CardDescription, CardContent } from "@/components/ui/card";
 
@@ -75,11 +78,16 @@ type BulkUploadSummary = {
 export default function FeedbackInboxPage() {
   const queryClient = useQueryClient();
   const { data: session } = useSession();
+  const searchParams = useSearchParams();
   const userRole = session?.user?.role || "VIEWER";
   const isReadOnly = userRole === "VIEWER";
 
+  // URL search & id params integration from Global Search
+  const searchParamQ = searchParams?.get("search") || "";
+  const searchParamId = searchParams?.get("id") || "";
+
   // Search & Filter States
-  const [search, setSearch] = React.useState("");
+  const [search, setSearch] = React.useState(searchParamQ);
   const debouncedSearch = useDebounce(search, 300);
 
   const [sentiment, setSentiment] = React.useState("ALL");
@@ -97,7 +105,16 @@ export default function FeedbackInboxPage() {
   const [pageSize, setPageSize] = React.useState(10);
 
   // Selected feedback ID
-  const [selectedId, setSelectedId] = React.useState<string | null>(null);
+  const [selectedId, setSelectedId] = React.useState<string | null>(searchParamId || null);
+
+  // Bulk Row Selection State
+  const [selectedRowIds, setSelectedRowIds] = React.useState<Set<string>>(new Set());
+
+  // Listen for search parameters changes from global search navigation
+  React.useEffect(() => {
+    if (searchParamQ) setSearch(searchParamQ);
+    if (searchParamId) setSelectedId(searchParamId);
+  }, [searchParamQ, searchParamId]);
 
   // Modals & Forms States
   const [isManualModalOpen, setIsManualModalOpen] = React.useState(false);
@@ -343,6 +360,9 @@ export default function FeedbackInboxPage() {
         const resData = await res.json();
         if (!res.ok || !resData.success) {
           throw new Error(resData.message || "Triage failed");
+        }
+        if (resData.data.processed === 0 && resData.data.remaining > 0) {
+          throw new Error("AI Triage failed to classify items. Please check Gemini API status/quota.");
         }
         remaining = resData.data.remaining;
         setTriageRemaining(remaining);
@@ -974,6 +994,35 @@ export default function FeedbackInboxPage() {
               <option value={50}>50 rows</option>
             </select>
           </div>
+          {selectedRowIds.size > 0 && (
+            <button
+              onClick={() => {
+                const selectedItems = feedbacks.filter((f) => selectedRowIds.has(f.id));
+                if (selectedItems.length === 0) return;
+                const headers = "ID,Customer Name,Customer Email,Sentiment,Source,Content,Submitted At\n";
+                const rows = selectedItems
+                  .map((f) => {
+                    const meta = f.metadata;
+                    const name = (meta.customerName || "").replace(/"/g, '""');
+                    const email = (meta.customerEmail || "").replace(/"/g, '""');
+                    const content = (f.content || "").replace(/"/g, '""');
+                    return `"${f.id}","${name}","${email}","${f.sentiment || "NEUTRAL"}","${f.source}","${content}","${f.submittedAt}"`;
+                  })
+                  .join("\n");
+
+                const blob = new Blob([headers + rows], { type: "text/csv;charset=utf-8;" });
+                const url = URL.createObjectURL(blob);
+                const link = document.createElement("a");
+                link.setAttribute("href", url);
+                link.setAttribute("download", `loop_selected_feedback_${Date.now()}.csv`);
+                link.click();
+              }}
+              className="flex items-center gap-1.5 px-3 py-1 rounded-lg bg-blue-600 text-white text-[11px] font-bold hover:bg-blue-700 transition-colors shadow-xs"
+            >
+              <Download className="w-3 h-3" />
+              <span>Export Selected ({selectedRowIds.size})</span>
+            </button>
+          )}
         </div>
       </Card>
 
@@ -984,9 +1033,24 @@ export default function FeedbackInboxPage() {
           <Card className="border border-slate-200 dark:border-white/[0.08] bg-card rounded-[18px] overflow-hidden">
             <div className="overflow-x-auto h-[550px] relative">
               <table className="w-full text-left border-collapse table-fixed" aria-label="Customer Feedback Registry Table">
-                <thead className="sticky top-0 bg-slate-50 dark:bg-slate-900/90 z-20 shadow-xs">
+                <thead className="sticky top-0 bg-slate-50 dark:bg-slate-900/95 backdrop-blur-md z-20 shadow-xs">
                   <tr className="border-b border-slate-100 text-[10px] font-bold text-slate-400 uppercase tracking-wider dark:border-white/[0.08]">
-                    <th onClick={() => cycleSorting("customerName")} className="p-4 pl-6 cursor-pointer hover:bg-slate-100 dark:hover:bg-slate-800 w-1/3">
+                    <th className="p-3 pl-4 w-10">
+                      <input
+                        type="checkbox"
+                        aria-label="Select all table rows"
+                        checked={feedbacks.length > 0 && selectedRowIds.size === feedbacks.length}
+                        onChange={() => {
+                          if (selectedRowIds.size === feedbacks.length) {
+                            setSelectedRowIds(new Set());
+                          } else {
+                            setSelectedRowIds(new Set(feedbacks.map((f) => f.id)));
+                          }
+                        }}
+                        className="rounded border-slate-300 text-blue-600 focus:ring-blue-500 cursor-pointer"
+                      />
+                    </th>
+                    <th onClick={() => cycleSorting("customerName")} className="p-4 cursor-pointer hover:bg-slate-100 dark:hover:bg-slate-800 w-1/3">
                       <div className="flex items-center gap-1">
                         <span>Customer</span>
                         <ArrowUpDown className="h-3 w-3" />
@@ -1012,7 +1076,8 @@ export default function FeedbackInboxPage() {
                     // Skeleton Loading States
                     Array.from({ length: 6 }).map((_, i) => (
                       <tr key={i} className="animate-pulse">
-                        <td className="p-4 pl-6">
+                        <td className="p-4 pl-4"><div className="h-3 w-3 bg-slate-200 dark:bg-slate-800 rounded" /></td>
+                        <td className="p-4">
                           <div className="h-3 w-24 bg-slate-200 dark:bg-slate-800 rounded mb-1.5" />
                           <div className="h-2 w-32 bg-slate-100 dark:bg-slate-900/60 rounded" />
                         </td>
@@ -1029,14 +1094,14 @@ export default function FeedbackInboxPage() {
                     ))
                   ) : isError ? (
                     <tr>
-                      <td colSpan={4} className="p-12 text-center text-rose-600 dark:text-rose-400">
+                      <td colSpan={5} className="p-12 text-center text-rose-600 dark:text-rose-400">
                         <AlertCircle className="h-6 w-6 mx-auto mb-2" />
                         <span className="text-xs font-semibold">Failed to fetch feedback. Please reload.</span>
                       </td>
                     </tr>
                   ) : feedbacks.length === 0 ? (
                     <tr>
-                      <td colSpan={4} className="p-12 text-center text-slate-400 text-xs font-medium">
+                      <td colSpan={5} className="p-12 text-center text-slate-400 text-xs font-medium">
                         <Inbox className="h-8 w-8 mx-auto mb-2 text-slate-300" />
                         <span>No feedback matching current filters found in workspace.</span>
                       </td>
@@ -1045,6 +1110,7 @@ export default function FeedbackInboxPage() {
                     feedbacks.map((item) => {
                       const meta = item.metadata;
                       const isSelected = item.id === selectedId;
+                      const isChecked = selectedRowIds.has(item.id);
                       return (
                         <tr
                           key={item.id}
@@ -1053,16 +1119,32 @@ export default function FeedbackInboxPage() {
                             isSelected ? "bg-blue-50/20 dark:bg-blue-950/10" : ""
                           }`}
                         >
-                          <td className="p-4 pl-6 truncate">
+                          <td className="p-3 pl-4" onClick={(e) => e.stopPropagation()}>
+                            <input
+                              type="checkbox"
+                              aria-label={`Select feedback item ${item.id}`}
+                              checked={isChecked}
+                              onChange={() => {
+                                setSelectedRowIds((prev) => {
+                                  const next = new Set(prev);
+                                  if (next.has(item.id)) next.delete(item.id);
+                                  else next.add(item.id);
+                                  return next;
+                                });
+                              }}
+                              className="rounded border-slate-300 text-blue-600 focus:ring-blue-500 cursor-pointer"
+                            />
+                          </td>
+                          <td className="p-4 truncate">
                             <p className="text-xs font-semibold text-slate-800 dark:text-slate-200">
-                              {meta.customerName || "Anonymous"}
+                              <HighlightMatch text={meta.customerName || "Anonymous"} query={debouncedSearch} />
                             </p>
                             <p className="text-[10px] text-slate-400 truncate">
-                              {meta.customerEmail || "anonymous@company.com"}
+                              <HighlightMatch text={meta.customerEmail || "anonymous@company.com"} query={debouncedSearch} />
                             </p>
                           </td>
                           <td className="p-4 text-xs text-slate-600 dark:text-[#94A3B8] truncate">
-                            {item.content}
+                            <HighlightMatch text={item.content} query={debouncedSearch} />
                           </td>
                           <td className="p-4">
                             <span className={`inline-block rounded-full px-2 py-0.5 text-[9px] font-bold border ${getSentimentBadge(item.sentiment)}`}>
@@ -1120,7 +1202,7 @@ export default function FeedbackInboxPage() {
                   </div>
                   <div>
                     <h3 className="text-sm font-bold text-slate-800 dark:text-[#F8FAFC]">
-                      {selectedItem.metadata.customerName || "Anonymous User"}
+                      <HighlightMatch text={selectedItem.metadata.customerName || "Anonymous User"} query={debouncedSearch} />
                     </h3>
                     <p className="text-[10px] text-slate-400">
                       via {selectedItem.source} · {new Date(selectedItem.submittedAt).toLocaleString()}
@@ -1150,7 +1232,7 @@ export default function FeedbackInboxPage() {
                     Feedback body
                   </h4>
                   <p className="text-xs text-slate-700 leading-relaxed dark:text-slate-200 bg-slate-50 dark:bg-slate-900/40 p-4 rounded-xl border dark:border-slate-800">
-                    {selectedItem.content}
+                    <HighlightMatch text={selectedItem.content} query={debouncedSearch} />
                   </p>
                 </div>
 

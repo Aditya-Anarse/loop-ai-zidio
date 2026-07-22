@@ -223,9 +223,11 @@ AI operations are divided into four primary tasks powered by **Google Gemini API
 - **Purpose**: Ask questions about customer feedback (RAG).
 - **Response**: Grounded answers using strictly verified database citations.
 
-### 8. `POST /api/reports/voc`
-- **Purpose**: Synthesize overall customer feedback trends into markdown reports.
-- **Roles**: `ADMIN` or `ANALYST`.
+### 9. `GET /api/search`
+- **Purpose**: Global search across Feedback, Customer Entities, VoC Reports, Themes, and Settings.
+- **Authentication**: NextAuth session cookie (JWT).
+- **Parameters**: `q` (search query term).
+- **Response**: Returns categorized search results with text match metadata and direct navigation routes.
 
 ---
 

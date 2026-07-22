@@ -2,6 +2,20 @@ import { prisma } from "@/lib/prisma";
 import { FeedbackSource, Sentiment, WorkspaceRole, ReportStatus, Prisma } from "@prisma/client";
 import { AiService } from "./ai-service";
 
+export function getModelDisplayName(model: string | undefined): string {
+  if (!model) return "Google Gemini AI";
+  if (model.includes("gemini-2.0-flash")) return "Gemini 2.0 Flash";
+  if (model.includes("gemini-2.5-flash")) return "Gemini 2.5 Flash";
+  if (model.includes("gemini-2.5-pro")) return "Gemini 2.5 Pro";
+  if (model.startsWith("gemini-")) {
+    return model
+      .split("-")
+      .map(word => word.charAt(0).toUpperCase() + word.slice(1))
+      .join(" ");
+  }
+  return "Google Gemini AI";
+}
+
 export type IngestFeedbackInput = {
   content: string;
   source: FeedbackSource;
@@ -18,6 +32,13 @@ export type IngestFeedbackInput = {
   confidence?: number;
   promptVersion?: string;
   modelVersion?: string;
+  
+  // New fields
+  severity?: string;
+  themes?: string[];
+  summary?: string;
+  processingTime?: number;
+  provider?: string;
 };
 
 export class DbService {
@@ -26,6 +47,31 @@ export class DbService {
    */
   static async ingestFeedback(workspaceId: string, input: IngestFeedbackInput, creatorName = "System Ingestion") {
     return await prisma.$transaction(async (tx) => {
+      // Convert confidence to float if it is 0-100
+      const confidenceVal = input.confidence !== undefined
+        ? (input.confidence > 1 ? input.confidence / 100 : input.confidence)
+        : 0.85;
+
+      const timeline = [
+        {
+          type: "CREATED",
+          user: creatorName,
+          timestamp: new Date().toISOString(),
+          description: "Feedback logged in system.",
+        },
+      ];
+
+      if (input.sentiment) {
+        timeline.push({
+          type: "AI_CLASSIFIED",
+          user: getModelDisplayName(input.modelVersion),
+          timestamp: new Date().toISOString(),
+          description: input.modelVersion === "reused-dedup"
+            ? "Reused classification from duplicate item."
+            : `Auto-classified (Score: ${input.score}, Priority: ${input.priority}, Confidence: ${Math.round(confidenceVal * 100)}%)`,
+        });
+      }
+
       // 1. Prepare structured metadata with audit timeline log
       const metadata = {
         customerName: input.customerName || "Anonymous User",
@@ -36,17 +82,20 @@ export class DbService {
         status: "NEW",
         tags: input.tags || [],
         priority: input.priority || "MEDIUM",
-        confidence: input.confidence !== undefined ? input.confidence : 0.85,
+        confidence: confidenceVal,
         promptVersion: input.promptVersion || "v1.0",
         modelVersion: input.modelVersion || "unknown",
-        timeline: [
-          {
-            type: "CREATED",
-            user: creatorName,
-            timestamp: new Date().toISOString(),
-            description: "Feedback logged in system.",
-          },
-        ],
+        
+        // Requirement 9 AI Metadata fields
+        model: input.modelVersion || "unknown",
+        provider: input.provider || "Google",
+        processingTime: input.processingTime || 0,
+        themes: input.themes || (input.theme ? [input.theme] : ["General"]),
+        summary: input.summary || "No summary provided.",
+        severity: input.severity || "MEDIUM",
+        sentiment: input.sentiment || "NEUTRAL",
+        
+        timeline,
       };
 
       // 2. Create the Feedback record
@@ -334,7 +383,7 @@ export class DbService {
   }
 
   /**
-   * Batch triage queue processor. Avoids Claude API duplicate requests.
+   * Batch triage queue processor. Avoids Gemini API duplicate requests.
    */
   static async triageBatchFeedbacks(workspaceId: string, limit = 5) {
     const unclassified = await prisma.feedback.findMany({
@@ -394,20 +443,30 @@ export class DbService {
             confidence: dupMeta.confidence || 0.95,
             promptVersion: dupMeta.promptVersion || "v1.1",
             modelVersion: dupMeta.modelVersion || "reused-dedup",
+            
+            // New fields for duplicate reuse
+            themes: dupMeta.themes || [dupMeta.theme || "General Feedback"],
+            severity: dupMeta.severity || "MEDIUM",
+            processingTime: dupMeta.processingTime || 0,
+            provider: dupMeta.provider || "Google",
           };
           reused = true;
         } else {
           result = await AiService.classifyFeedback(item.content);
         }
 
+        const confidenceVal = result.confidence !== undefined
+          ? (result.confidence > 1 ? result.confidence / 100 : result.confidence)
+          : 0.85;
+
         const timeline = [...(currentMeta.timeline || [])];
         timeline.push({
           type: "AI_CLASSIFIED",
-          user: "Claude AI Processor",
+          user: getModelDisplayName(result.modelVersion),
           timestamp: new Date().toISOString(),
           description: reused
             ? "Reused classification from duplicate item."
-            : `Auto-classified (Score: ${result.score}, Priority: ${result.priority}, Confidence: ${Math.round(result.confidence * 100)}%)`,
+            : `Auto-classified (Score: ${result.score}, Priority: ${result.priority}, Confidence: ${Math.round(confidenceVal * 100)}%)`,
         });
 
         const updatedMetadata = {
@@ -416,9 +475,19 @@ export class DbService {
           area: result.area,
           theme: result.theme,
           priority: result.priority,
-          confidence: result.confidence,
+          confidence: confidenceVal,
           promptVersion: result.promptVersion,
           modelVersion: result.modelVersion,
+          
+          // Requirement 9 AI Metadata fields
+          model: result.modelVersion || "unknown",
+          provider: result.provider || "Google",
+          processingTime: result.processingTime || 0,
+          themes: result.themes || [result.theme],
+          summary: result.summary,
+          severity: result.severity || "MEDIUM",
+          sentiment: result.sentiment,
+          
           triageState: "COMPLETED",
           status: currentMeta.status || "NEW",
           timeline,
@@ -470,7 +539,7 @@ export class DbService {
         });
 
         processedCount++;
-      } catch (err) {
+      } catch (err: any) {
         console.error(`Batch triage item processing failure for feedback ID ${item.id}:`, err);
         await prisma.feedback.update({
           where: { id: item.id },
@@ -478,6 +547,7 @@ export class DbService {
             metadata: {
               ...currentMeta,
               triageState: "FAILED",
+              triageError: err?.message || String(err),
             } as any,
           },
         });
@@ -663,4 +733,157 @@ export class DbService {
     const data = Object.values(monthlyStats);
     return data.length > 0 ? data : [{ name: "Jul", count: 12, positive: 8 }];
   }
+
+  /**
+   * Global search across Feedback, Customers, Reports, Themes, and Settings
+   */
+  static async globalSearch(workspaceId: string, query: string) {
+    const q = query.trim();
+    if (!q) {
+      return {
+        feedback: [],
+        customers: [],
+        reports: [],
+        themes: [],
+        settings: [],
+        totalResults: 0,
+      };
+    }
+
+    const insensitiveQuery = q.toLowerCase();
+
+    // 1. Search Feedback (Content, customerName, customerEmail, summary)
+    const feedbackItems = await prisma.feedback.findMany({
+      where: {
+        workspaceId,
+        OR: [
+          { content: { contains: q, mode: "insensitive" } },
+          { metadata: { path: ["customerName"], string_contains: q } },
+          { metadata: { path: ["customerEmail"], string_contains: q } },
+          { metadata: { path: ["summary"], string_contains: q } },
+        ],
+      },
+      take: 10,
+      orderBy: { submittedAt: "desc" },
+    });
+
+    // 2. Search Reports
+    const reportItems = await prisma.report.findMany({
+      where: {
+        workspaceId,
+        OR: [
+          { title: { contains: q, mode: "insensitive" } },
+        ],
+      },
+      take: 5,
+      orderBy: { createdAt: "desc" },
+    });
+
+    // 3. Search Themes
+    const themeItems = await prisma.theme.findMany({
+      where: {
+        workspaceId,
+        OR: [
+          { name: { contains: q, mode: "insensitive" } },
+          { description: { contains: q, mode: "insensitive" } },
+        ],
+      },
+      take: 5,
+    });
+
+    // 4. Extract Customers matching query from feedback metadata
+    const allFeedbackMeta = await prisma.feedback.findMany({
+      where: { workspaceId },
+      select: { metadata: true },
+      take: 100,
+    });
+
+    const customersMap = new Map<string, { name: string; email: string; label: string }>();
+    allFeedbackMeta.forEach((f) => {
+      const meta = f.metadata as Record<string, any>;
+      const name = meta?.customerName || "";
+      const email = meta?.customerEmail || "";
+      const label = meta?.customerLabel || "free";
+
+      if (
+        name.toLowerCase().includes(insensitiveQuery) ||
+        email.toLowerCase().includes(insensitiveQuery)
+      ) {
+        const key = email || name;
+        if (key && !customersMap.has(key)) {
+          customersMap.set(key, { name: name || "Anonymous User", email: email || "N/A", label });
+        }
+      }
+    });
+    const customerItems = Array.from(customersMap.values()).slice(0, 5);
+
+    // 5. Settings search
+    const settingsPages = [
+      { id: "profile", title: "User Profile & Identity", description: "Manage full name, email, and role", href: "/app/settings?section=profile" },
+      { id: "team", title: "Workspace Team Members", description: "View team members and workspace permissions", href: "/app/settings?section=team" },
+      { id: "credentials", title: "AI & System Credentials", description: "Inspect DATABASE_URL and GEMINI_API_KEY environment status", href: "/app/settings?section=credentials" },
+      { id: "integrations", title: "Integrations & API Connections", description: "Connect Zendesk, Intercom, and Slack channels", href: "/app/integrations" },
+      { id: "sentiment", title: "Sentiment Analytics & Distribution", description: "View sentiment breakdown and negative theme telemetry", href: "/app/sentiment" },
+    ];
+
+    const settingItems = settingsPages.filter(
+      (s) => s.title.toLowerCase().includes(insensitiveQuery) || s.description.toLowerCase().includes(insensitiveQuery)
+    );
+
+    const totalResults =
+      feedbackItems.length + customerItems.length + reportItems.length + themeItems.length + settingItems.length;
+
+    return {
+      feedback: feedbackItems.map((item) => {
+        const meta = item.metadata as Record<string, any>;
+        return {
+          id: item.id,
+          type: "feedback",
+          title: meta.customerName ? `${meta.customerName}'s Feedback` : "Customer Feedback",
+          content: item.content,
+          customerName: meta.customerName || "Anonymous",
+          customerEmail: meta.customerEmail || "",
+          summary: meta.summary || item.content.slice(0, 100),
+          sentiment: item.sentiment || "NEUTRAL",
+          submittedAt: item.submittedAt,
+          href: `/app/feedback?search=${encodeURIComponent(q)}&id=${item.id}`,
+        };
+      }),
+      customers: customerItems.map((c, i) => ({
+        id: `customer-${i}`,
+        type: "customer",
+        title: c.name,
+        email: c.email,
+        label: c.label,
+        href: `/app/feedback?search=${encodeURIComponent(c.email || c.name)}`,
+      })),
+      reports: reportItems.map((r) => {
+        const content = r.content as any;
+        return {
+          id: r.id,
+          type: "report",
+          title: r.title,
+          summary: content?.text ? content.text.slice(0, 120) + "..." : "Voice of Customer Report",
+          createdAt: r.createdAt,
+          href: `/app/reports?id=${r.id}`,
+        };
+      }),
+      themes: themeItems.map((t) => ({
+        id: t.id,
+        type: "theme",
+        title: t.name,
+        description: t.description || "Workspace theme",
+        href: `/app/feedback?search=${encodeURIComponent(t.name)}`,
+      })),
+      settings: settingItems.map((s) => ({
+        id: s.id,
+        type: "setting",
+        title: s.title,
+        description: s.description,
+        href: s.href,
+      })),
+      totalResults,
+    };
+  }
 }
+

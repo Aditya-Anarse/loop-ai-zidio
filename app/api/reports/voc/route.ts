@@ -32,7 +32,7 @@ export async function POST() {
     const topThemes = negativeThemes.map(t => ({ name: t.name, count: t.count }));
     const fallbackThemes = topThemes.length > 0 ? topThemes : [{ name: "Performance", count: 1 }];
 
-    // 4. Generate report narrative through Claude based ONLY on the numbers above
+    // 4. Generate report narrative through Gemini AI based ONLY on the numbers above
     const narrative = await AiService.generateVoCReport(stats, fallbackQuotes, fallbackThemes);
 
     // 5. Save the report to database

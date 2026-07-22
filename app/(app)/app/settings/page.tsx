@@ -2,8 +2,9 @@
 
 import * as React from "react";
 import { useSession } from "next-auth/react";
+import { useSearchParams } from "next/navigation";
 import { Card, CardHeader, CardTitle, CardDescription, CardContent } from "@/components/ui/card";
-import { User, Users, Shield, Server, CheckCircle2, XCircle, AlertCircle, Key } from "lucide-react";
+import { User, Users, Shield, Server, CheckCircle2, XCircle, AlertCircle, Key, Cpu, Sparkles } from "lucide-react";
 
 type MemberItem = {
   name: string;
@@ -13,6 +14,8 @@ type MemberItem = {
 
 export default function SettingsPage() {
   const { data: session } = useSession();
+  const searchParams = useSearchParams();
+  const sectionParam = searchParams?.get("section") || "";
   const user = session?.user;
 
   // Mock workspace team members
@@ -38,7 +41,7 @@ export default function SettingsPage() {
         {/* Left column: Profile & Team */}
         <div className="lg:col-span-8 space-y-6">
           {/* Profile Card */}
-          <Card className="border border-slate-200 dark:border-white/[0.08] bg-card p-6 rounded-[20px]">
+          <Card className={`border border-slate-200 dark:border-white/[0.08] bg-card p-6 rounded-[20px] ${sectionParam === "profile" ? "ring-2 ring-blue-500" : ""}`}>
             <div className="flex items-center gap-2 mb-4 border-b border-slate-100 dark:border-white/[0.05] pb-3">
               <User className="h-4 w-4 text-blue-600" />
               <h3 className="text-sm font-bold text-slate-800 dark:text-slate-100">User Profile</h3>
@@ -66,7 +69,7 @@ export default function SettingsPage() {
           </Card>
 
           {/* Team Members List */}
-          <Card className="border border-slate-200 dark:border-white/[0.08] bg-card rounded-[18px] overflow-hidden">
+          <Card className={`border border-slate-200 dark:border-white/[0.08] bg-card rounded-[18px] overflow-hidden ${sectionParam === "team" ? "ring-2 ring-blue-500" : ""}`}>
             <CardHeader className="p-6 border-b border-slate-100 dark:border-white/[0.05]">
               <div className="flex items-center gap-2">
                 <Users className="h-4 w-4 text-emerald-600" />
@@ -118,9 +121,9 @@ export default function SettingsPage() {
           </Card>
         </div>
 
-        {/* Right column: Credentials Checker */}
-        <div className="lg:col-span-4">
-          <Card className="border border-slate-200 dark:border-white/[0.08] bg-card p-6 rounded-[20px] space-y-6">
+        {/* Right column: Credentials Checker & AI Model Info */}
+        <div className="lg:col-span-4 space-y-6">
+          <Card className={`border border-slate-200 dark:border-white/[0.08] bg-card p-6 rounded-[20px] space-y-6 ${sectionParam === "credentials" ? "ring-2 ring-blue-500" : ""}`}>
             <div className="flex items-center gap-2 border-b border-slate-100 dark:border-white/[0.05] pb-3">
               <Server className="h-4 w-4 text-purple-600" />
               <h3 className="text-sm font-bold text-slate-800 dark:text-slate-100">LOOP Credentials</h3>
@@ -157,7 +160,7 @@ export default function SettingsPage() {
                 <div className="flex items-center justify-between p-2.5 rounded-lg border border-slate-100 bg-slate-50/50 text-[11px] dark:border-white/[0.04] dark:bg-slate-900/20">
                   <div className="flex items-center gap-1.5 font-mono text-slate-600 dark:text-slate-300">
                     <Key className="h-3.5 w-3.5 text-blue-500" />
-                    <span>ANTHROPIC_API_KEY</span>
+                    <span>GEMINI_API_KEY</span>
                   </div>
                   <div className="flex items-center gap-1 text-emerald-600 dark:text-[#34D399]">
                     <CheckCircle2 className="h-4 w-4" />
@@ -174,8 +177,46 @@ export default function SettingsPage() {
               </div>
             </div>
           </Card>
+
+          {/* AI Intelligence Provider Status */}
+          <Card className="border border-slate-200 dark:border-white/[0.08] bg-card p-6 rounded-[20px] space-y-4">
+            <div className="flex items-center gap-2 border-b border-slate-100 dark:border-white/[0.05] pb-3">
+              <Cpu className="h-4 w-4 text-blue-500" />
+              <h3 className="text-sm font-bold text-slate-800 dark:text-slate-100">AI Model Engine</h3>
+            </div>
+            <div className="space-y-2 text-xs">
+              <div className="flex justify-between py-1 border-b border-slate-100 dark:border-white/[0.04]">
+                <span className="text-slate-400">Primary Provider</span>
+                <span className="font-semibold text-slate-700 dark:text-slate-200">Google Gemini AI</span>
+              </div>
+              <div className="flex justify-between py-1 border-b border-slate-100 dark:border-white/[0.04]">
+                <span className="text-slate-400">Default Model</span>
+                <span className="font-semibold text-blue-600 dark:text-blue-400">Gemini 2.5 Flash</span>
+              </div>
+              <div className="flex justify-between py-1 border-b border-slate-100 dark:border-white/[0.04]">
+                <span className="text-slate-400">Application Version</span>
+                <span className="font-mono text-[10px] font-bold text-slate-700 dark:text-slate-200">v1.0.0 (LOOP Core)</span>
+              </div>
+              <div className="flex justify-between py-1 border-b border-slate-100 dark:border-white/[0.04]">
+                <span className="text-slate-400">Classification Version</span>
+                <span className="font-mono text-[10px] text-slate-600 dark:text-slate-300">v1.2</span>
+              </div>
+              <div className="flex justify-between py-1 border-b border-slate-100 dark:border-white/[0.04]">
+                <span className="text-slate-400">Last Deployment</span>
+                <span className="text-xs text-slate-600 dark:text-slate-300">July 21, 2026</span>
+              </div>
+              <div className="flex justify-between py-1">
+                <span className="text-slate-400">Status</span>
+                <span className="text-emerald-600 font-bold flex items-center gap-1">
+                  <span className="h-2 w-2 rounded-full bg-emerald-500 animate-ping"></span>
+                  Operational
+                </span>
+              </div>
+            </div>
+          </Card>
         </div>
       </div>
     </div>
   );
 }
+

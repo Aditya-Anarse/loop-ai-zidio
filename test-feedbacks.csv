@@ -1,0 +1,4 @@
+customerName,customerEmail,feedback,source,createdAt
+Alice Smith,alice@example.com,"We absolutely love the product! The new features are excellent, amazing and the checkout is incredibly fast and smooth. Highly recommend!",CSV,2026-07-18T12:00:00Z
+Bob Jones,bob@example.com,"This is terrible. The system crashed and there is a critical database bug that makes it unusable. I am extremely disappointed and frustrated. Broken.",CSV,2026-07-18T12:05:00Z
+Charlie Brown,charlie@example.com,"The documentation is informative and okay. It is acceptable and works fine for our average daily tasks.",CSV,2026-07-18T12:10:00Z
