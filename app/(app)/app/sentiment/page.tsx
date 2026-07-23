@@ -15,15 +15,15 @@ export default async function SentimentPage() {
   const negativeTopics = await DbService.getNegativeTopics(workspaceId, 5);
   const recentFeedback = await DbService.getRecentFeedback(workspaceId, 10);
 
-  const total = recentFeedback.length;
-  const positive = recentFeedback.filter(f => f.sentiment === "POSITIVE").length;
-  const neutral = recentFeedback.filter(f => f.sentiment === "NEUTRAL").length;
-  const negative = recentFeedback.filter(f => f.sentiment === "NEGATIVE").length;
+  const total = stats.totalFeedback;
+  const positive = stats.positiveCount;
+  const neutral = stats.neutralCount;
+  const negative = stats.negativeCount;
 
   const sentimentBreakdown = [
-    { name: "Positive", value: total > 0 ? Math.round((positive / total) * 100) : 50, color: "#10b981" },
-    { name: "Neutral", value: total > 0 ? Math.round((neutral / total) * 100) : 30, color: "#64748b" },
-    { name: "Negative", value: total > 0 ? Math.round((negative / total) * 100) : 20, color: "#ef4444" },
+    { name: "Positive", value: total > 0 ? Math.round((positive / total) * 100) : 0, color: "#10b981" },
+    { name: "Neutral", value: total > 0 ? Math.round((neutral / total) * 100) : 0, color: "#64748b" },
+    { name: "Negative", value: total > 0 ? Math.round((negative / total) * 100) : 0, color: "#ef4444" },
   ];
 
   const mappedThemeData = negativeTopics.map((topic) => ({

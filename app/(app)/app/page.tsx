@@ -26,22 +26,22 @@ export default async function AppPage() {
 
   // 1. Fetch real statistics from PostgreSQL
   const stats = await DbService.getOverviewStats(workspaceId);
-  const recentFeedback = await DbService.getRecentFeedback(workspaceId, 4);
-  const negativeTopics = await DbService.getNegativeTopics(workspaceId, 3);
+  const recentFeedback = await DbService.getRecentFeedback(workspaceId, 5);
+  const negativeTopics = await DbService.getNegativeTopics(workspaceId, 5);
   const chartData = await DbService.getAnalyticsCharts(workspaceId);
 
   // Map database chart data to fit Recharts expected schemas
   const mappedTrendData = chartData.map((item) => ({
-    date: item.name,
-    volume: item.count,
+    date: item.date,
+    volume: item.total,
     positive: item.positive,
-    negative: Math.max(0, item.count - item.positive),
+    negative: item.negative,
   }));
 
   // Fetch sentiment records to calculate exact percentages
   const totalCount = stats.totalFeedback;
-  const positivePct = totalCount > 0 ? Math.round((recentFeedback.filter(f => f.sentiment === "POSITIVE").length / Math.max(recentFeedback.length, 1)) * 100) : 0;
-  const negativePct = totalCount > 0 ? Math.round((recentFeedback.filter(f => f.sentiment === "NEGATIVE").length / Math.max(recentFeedback.length, 1)) * 100) : 0;
+  const positivePct = totalCount > 0 ? Math.round((stats.positiveCount / totalCount) * 100) : 0;
+  const negativePct = totalCount > 0 ? Math.round((stats.negativeCount / totalCount) * 100) : 0;
   const neutralPct = totalCount > 0 ? Math.max(0, 100 - positivePct - negativePct) : 0;
 
   const sentimentBreakdown = [
@@ -85,6 +85,23 @@ export default async function AppPage() {
   // Determine trend icon indicator directions
   const volumeDiffPositive = !stats.trendComparison.volumeDiff.startsWith("-");
   const sentimentDiffPositive = !stats.trendComparison.sentimentDiff.startsWith("-");
+
+  // Detailed backend log before server render
+  console.log(
+    JSON.stringify({
+      event: "DASHBOARD_DATA_RENDERED",
+      workspaceId,
+      totalFeedback: stats.totalFeedback,
+      sentimentCounts: {
+        positive: stats.positiveCount,
+        negative: stats.negativeCount,
+        neutral: stats.neutralCount,
+      },
+      themeCounts: mappedThemeData.map((t) => ({ theme: t.name, count: t.value })),
+      trendData: mappedTrendData,
+      timestamp: new Date().toISOString(),
+    })
+  );
 
   return (
     <div className="space-y-8">

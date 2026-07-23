@@ -140,9 +140,96 @@ export default function FeedbackInboxPage() {
   const [uploadSummary, setUploadSummary] = React.useState<BulkUploadSummary | null>(null);
   const [showSummaryModal, setShowSummaryModal] = React.useState(false);
 
-  // AI Triage Batch Queue states
-  const [triageState, setTriageState] = React.useState<"IDLE" | "QUEUED" | "PROCESSING" | "COMPLETED" | "FAILED">("IDLE");
+  // AI Triage Persistent Job Queue states
+  const [triageState, setTriageState] = React.useState<"IDLE" | "QUEUED" | "PROCESSING" | "COMPLETED" | "FAILED" | "CANCELLED">("IDLE");
+  const [triageStage, setTriageStage] = React.useState<"Fetching feedback" | "Preparing AI context" | "Gemini analysis" | "Saving results" | "Completed" | "Idle">("Idle");
+  const [triageTotal, setTriageTotal] = React.useState(0);
+  const [triageCompleted, setTriageCompleted] = React.useState(0);
+  const [triageFailedCount, setTriageFailedCount] = React.useState(0);
   const [triageRemaining, setTriageRemaining] = React.useState(0);
+  const [triageFailedDetails, setTriageFailedDetails] = React.useState<Array<{ id: string; customerName: string; errorMessage: string }>>([]);
+  const [triageTelemetry, setTriageTelemetry] = React.useState<any>(null);
+  const [activeJobId, setActiveJobId] = React.useState<string | null>(null);
+
+  // Poll background job status every 2 seconds
+  const { data: triageStatusData } = useQuery({
+    queryKey: ["triageStatus", activeJobId],
+    queryFn: async () => {
+      const url = activeJobId ? `/api/feedback/triage?jobId=${activeJobId}` : "/api/feedback/triage";
+      const res = await fetch(url);
+      if (!res.ok) return null;
+      const data = await res.json();
+      return data.data;
+    },
+    refetchInterval: (query) => {
+      const job = query.state.data?.activeJob;
+      if (job && (job.status === "QUEUED" || job.status === "PROCESSING")) {
+        return 2000;
+      }
+      return 5000;
+    },
+  });
+
+  // Sync background job telemetry & progress state
+  React.useEffect(() => {
+    if (triageStatusData?.activeJob) {
+      const job = triageStatusData.activeJob;
+      setTriageState(job.status);
+      setTriageStage(job.stage || "Idle");
+      setTriageTotal(job.totalCount || 0);
+      setTriageCompleted(job.processedCount || 0);
+      setTriageFailedCount(job.failedCount || 0);
+      setTriageRemaining(job.remainingCount || 0);
+      if (job.failedDetails) setTriageFailedDetails(job.failedDetails);
+      if (job.telemetry) setTriageTelemetry(job.telemetry);
+      setActiveJobId(job.id);
+
+      if (job.status === "COMPLETED" || job.status === "FAILED") {
+        queryClient.invalidateQueries({ queryKey: ["feedback"] });
+      }
+    }
+  }, [triageStatusData, queryClient]);
+
+  // Execute or retry background batch queue triage
+  const handleRunTriage = async (retryFailedOnly = false) => {
+    if (isReadOnly || triageState === "PROCESSING") return;
+
+    setTriageState("QUEUED");
+    setTriageStage("Fetching feedback");
+
+    try {
+      const res = await fetch("/api/feedback/triage", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          action: retryFailedOnly ? "retry_failed" : "start",
+          limit: 100,
+        }),
+      });
+
+      const resData = await res.json();
+      if (!res.ok || !resData.success) {
+        throw new Error(resData.message || "Failed to start AI Triage job.");
+      }
+
+      const job = resData.data;
+      if (job && job.id) {
+        setActiveJobId(job.id);
+        setTriageState(job.status || "PROCESSING");
+        setTriageStage(job.stage || "Fetching feedback");
+        setTriageTotal(job.totalCount || 0);
+        showToast(retryFailedOnly ? "Retrying failed items in background..." : "AI Triage started in background!");
+      } else if (resData.message) {
+        showToast(resData.message);
+        setTriageState("IDLE");
+      }
+    } catch (err: any) {
+      setTriageState("FAILED");
+      setTriageStage("Idle");
+      showToast(err.message || "Gemini service temporarily unavailable. Retry in a few seconds.", "error");
+      setTimeout(() => setTriageState("IDLE"), 4000);
+    }
+  };
 
   // Focus management refs
   const firstManualInputRef = React.useRef<HTMLInputElement>(null);
@@ -342,42 +429,7 @@ export default function FeedbackInboxPage() {
     },
   });
 
-  // Execute batch queue triage sequentially
-  const handleRunTriage = async () => {
-    if (isReadOnly) return;
-    setTriageState("QUEUED");
-    try {
-      setTriageState("PROCESSING");
-      let remaining = unclassifiedCount;
-      setTriageRemaining(remaining);
 
-      while (remaining > 0) {
-        const res = await fetch("/api/feedback/triage", {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ limit: 5 }),
-        });
-        const resData = await res.json();
-        if (!res.ok || !resData.success) {
-          throw new Error(resData.message || "Triage failed");
-        }
-        if (resData.data.processed === 0 && resData.data.remaining > 0) {
-          throw new Error("AI Triage failed to classify items. Please check Gemini API status/quota.");
-        }
-        remaining = resData.data.remaining;
-        setTriageRemaining(remaining);
-        queryClient.invalidateQueries({ queryKey: ["feedback"] });
-      }
-
-      setTriageState("COMPLETED");
-      showToast("AI Triage batch processing completed successfully!");
-      setTimeout(() => setTriageState("IDLE"), 3000);
-    } catch (err: any) {
-      setTriageState("FAILED");
-      showToast(err.message || "Error running batch AI triage.", "error");
-      setTimeout(() => setTriageState("IDLE"), 4000);
-    }
-  };
 
   // Trigger manual entry ingestion
   const handleManualSubmit = (e: React.FormEvent) => {
@@ -699,6 +751,19 @@ export default function FeedbackInboxPage() {
     setPage(1);
   };
 
+  const getStageStatusIcon = (stageName: string) => {
+    const stages = ["Fetching feedback", "Preparing AI context", "Gemini analysis", "Saving results", "Completed"];
+    const currentIdx = stages.indexOf(triageStage);
+    const targetIdx = stages.indexOf(stageName);
+
+    if (currentIdx > targetIdx || triageState === "COMPLETED") {
+      return <CheckCircle2 className="h-3 w-3 text-emerald-500 inline" />;
+    } else if (currentIdx === targetIdx && triageState === "PROCESSING") {
+      return <Loader2 className="h-3 w-3 animate-spin text-blue-500 inline" />;
+    }
+    return <span className="h-2 w-2 rounded-full border border-slate-400 inline-block opacity-40" />;
+  };
+
   return (
     <div className="space-y-6">
       {/* Toast Alert Notification */}
@@ -723,35 +788,103 @@ export default function FeedbackInboxPage() {
       </AnimatePresence>
 
       {/* Triage Banner Segment (AI Queue Queue states tracker) */}
-      {!isReadOnly && unclassifiedCount > 0 && (
+      {!isReadOnly && (unclassifiedCount > 0 || triageState === "PROCESSING" || triageFailedCount > 0) && (
         <div className="flex flex-col gap-3 rounded-2xl border border-blue-100 bg-blue-50/40 p-4 dark:border-blue-900/30 dark:bg-blue-950/10 md:flex-row md:items-center md:justify-between">
           <div className="flex items-start gap-3">
             <div className="mt-0.5 rounded-lg bg-blue-500/10 p-1.5 text-blue-600 dark:text-blue-400">
               <Cpu className="h-4 w-4" />
             </div>
             <div>
-              <h4 className="text-xs font-bold text-slate-800 dark:text-[#F8FAFC]">AI Triage Queue Pending</h4>
+              <h4 className="text-xs font-bold text-slate-800 dark:text-[#F8FAFC]">
+                {triageState === "PROCESSING"
+                  ? `AI Triage Pipeline Active (${triageStage})`
+                  : triageFailedCount > 0
+                  ? `${triageFailedCount} feedback items failed. Click 'Retry Failed Items' to re-process.`
+                  : "AI Triage Queue Pending"}
+              </h4>
               <p className="text-[11px] text-slate-500 dark:text-[#94A3B8]">
-                There are <span className="font-bold text-blue-600 dark:text-blue-400">{unclassifiedCount}</span> items awaiting sentiment, theme, and severity categorization.
+                {triageState === "PROCESSING" ? (
+                  <>
+                    Processing feedback <span className="font-bold text-blue-600 dark:text-blue-400">{triageCompleted}</span> of{" "}
+                    <span className="font-bold text-blue-600 dark:text-blue-400">{triageTotal}</span> ({triageRemaining} remaining)
+                  </>
+                ) : (
+                  <>
+                    There are <span className="font-bold text-blue-600 dark:text-blue-400">{unclassifiedCount}</span> items awaiting sentiment, theme, and severity categorization.
+                  </>
+                )}
               </p>
+              
+              {/* Real-Time Progress Stage Checklist */}
+              <div className="mt-2 flex flex-wrap items-center gap-2 text-[11px] font-medium text-slate-600 dark:text-slate-400">
+                <span className="flex items-center gap-1">
+                  {getStageStatusIcon("Fetching feedback")} Fetching feedback
+                </span>
+                <span className="text-slate-300 dark:text-slate-700">&bull;</span>
+                <span className="flex items-center gap-1">
+                  {getStageStatusIcon("Preparing AI context")} Preparing AI context
+                </span>
+                <span className="text-slate-300 dark:text-slate-700">&bull;</span>
+                <span className="flex items-center gap-1">
+                  {getStageStatusIcon("Gemini analysis")} Gemini analysis
+                </span>
+                <span className="text-slate-300 dark:text-slate-700">&bull;</span>
+                <span className="flex items-center gap-1">
+                  {getStageStatusIcon("Saving results")} Saving results
+                </span>
+              </div>
+
+              {/* Detailed Item Failure Reasons */}
+              {triageFailedCount > 0 && triageFailedDetails.length > 0 && (
+                <div className="mt-2.5 rounded-lg border border-rose-200 bg-rose-50/70 p-2.5 text-[11px] text-rose-800 dark:border-rose-900/40 dark:bg-rose-950/20 dark:text-rose-300">
+                  <span className="font-bold text-rose-900 dark:text-rose-200">Failure Reasons:</span>
+                  <ul className="mt-1 list-disc pl-4 space-y-0.5 max-h-24 overflow-y-auto">
+                    {triageFailedDetails.map((detail, idx) => (
+                      <li key={idx}>
+                        <span className="font-semibold">{detail.customerName}:</span> {detail.errorMessage}
+                      </li>
+                    ))}
+                  </ul>
+                </div>
+              )}
+
+              {/* Execution Telemetry Summary */}
+              {triageTelemetry && (
+                <div className="mt-2 text-[10px] font-mono text-slate-500 dark:text-slate-400 flex flex-wrap items-center gap-3">
+                  <span>Total: <strong className="text-slate-700 dark:text-slate-300">{triageTotal}</strong></span>
+                  <span>&bull;</span>
+                  <span>Successful: <strong className="text-emerald-600 dark:text-emerald-400">{triageCompleted}</strong></span>
+                  <span>&bull;</span>
+                  <span>Failed: <strong className="text-rose-600 dark:text-rose-400">{triageFailedCount}</strong></span>
+                  <span>&bull;</span>
+                  <span>Processing Time: <strong className="text-blue-600 dark:text-blue-400">{(triageTelemetry.processingTimeMs / 1000).toFixed(2)}s</strong></span>
+                </div>
+              )}
+
+              {/* Gemini Quota Fallback Notice */}
+              {triageTelemetry?.fallbackUsed && (
+                <div className="mt-2.5 rounded-lg border border-amber-200 bg-amber-50/80 p-2.5 text-[11px] font-semibold text-amber-800 dark:border-amber-900/40 dark:bg-amber-950/30 dark:text-amber-300">
+                  ⚡ Gemini quota reached. {triageCompleted} items processed using local fallback analysis.
+                </div>
+              )}
             </div>
           </div>
           <button
-            onClick={handleRunTriage}
+            onClick={() => handleRunTriage(triageFailedCount > 0 && triageState !== "PROCESSING")}
             disabled={triageState === "PROCESSING"}
             className="flex items-center gap-2 rounded-xl bg-blue-600 px-4 py-2 text-xs font-semibold text-white shadow-sm hover:bg-blue-700 transition-colors disabled:opacity-75"
           >
             {triageState === "PROCESSING" ? (
               <>
                 <Loader2 className="h-3.5 w-3.5 animate-spin" />
-                <span>Processing... ({triageRemaining} left)</span>
+                <span>Processing {triageCompleted}/{triageTotal}</span>
               </>
             ) : triageState === "QUEUED" ? (
               <span>Queued...</span>
             ) : triageState === "COMPLETED" ? (
               <span>Completed!</span>
-            ) : triageState === "FAILED" ? (
-              <span>Failed. Retry?</span>
+            ) : triageFailedCount > 0 ? (
+              <span>Retry Failed Items</span>
             ) : (
               <span>Run AI Triage</span>
             )}

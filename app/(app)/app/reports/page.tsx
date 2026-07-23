@@ -13,13 +13,27 @@ import {
   MessageSquare,
   ArrowRight,
   TrendingUp,
+  Trash2,
 } from "lucide-react";
 import { Card, CardHeader, CardTitle, CardDescription, CardContent } from "@/components/ui/card";
 
 type ReportItem = {
   id: string;
   title: string;
-  content: { text: string };
+  status: "DRAFT" | "GENERATING" | "READY" | "FAILED";
+  content: {
+    text: string;
+    errorType?: "AI_UNAVAILABLE" | "NO_FEEDBACK" | "GEMINI_QUOTA_EXCEEDED" | "GENERATION_FAILED";
+    errorMessage?: string;
+    confidence?: number;
+    metadata?: {
+      provider?: string;
+      modelName?: string;
+      processingTime?: number;
+      generatedTimestamp?: string;
+      feedbackAnalyzed?: number;
+    };
+  } | null;
   createdAt: string;
 };
 
@@ -63,6 +77,9 @@ export default function ReportsPage() {
   const [isQaSearching, setIsQaSearching] = React.useState(false);
   const [qaTime, setQaTime] = React.useState<number | null>(null);
 
+  // Search input state for digests list
+  const [searchQuery, setSearchQuery] = React.useState("");
+
   // Selected Report State
   const [selectedReportId, setSelectedReportId] = React.useState<string | null>(reportParamId || null);
 
@@ -85,11 +102,12 @@ export default function ReportsPage() {
   const reports: ReportItem[] = data?.reports || [];
   const selectedReport = reports.find((r) => r.id === selectedReportId) || reports[0];
 
-  // Mutation: Generate new VoC Report
+  // Mutation: Generate or regenerate VoC Report
   const generateReportMutation = useMutation({
-    mutationFn: async () => {
-      const res = await fetch("/api/reports/voc", { method: "POST" });
-      if (!res.ok) throw new Error("Report generation failed.");
+    mutationFn: async (reportId?: string) => {
+      const url = reportId ? `/api/reports/voc?reportId=${reportId}` : "/api/reports/voc";
+      const res = await fetch(url, { method: "POST" });
+      if (!res.ok) throw new Error("Report synthesis failed.");
       return res.json();
     },
     onSuccess: (newData) => {
@@ -97,10 +115,27 @@ export default function ReportsPage() {
       if (newData.report) {
         setSelectedReportId(newData.report.id);
       }
-      alert("Voice-of-Customer report generated successfully!");
+      alert("Voice-of-Customer report synthesized successfully!");
     },
     onError: (err: any) => {
       alert(err.message || "Error generating report.");
+    },
+  });
+
+  // Mutation: Delete VoC Report
+  const deleteReportMutation = useMutation({
+    mutationFn: async (id: string) => {
+      const res = await fetch(`/api/reports/voc?id=${id}`, { method: "DELETE" });
+      if (!res.ok) throw new Error("Failed to delete report.");
+      return res.json();
+    },
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: ["reports"] });
+      setSelectedReportId(null);
+      alert("Report deleted successfully.");
+    },
+    onError: (err: any) => {
+      alert(err.message || "Error deleting report.");
     },
   });
 
@@ -133,6 +168,11 @@ export default function ReportsPage() {
     }
   };
 
+  // Filter reports list based on search query
+  const filteredReports = reports.filter((report) =>
+    report.title.toLowerCase().includes(searchQuery.toLowerCase())
+  );
+
   return (
     <div className="space-y-8">
       {/* Header */}
@@ -147,11 +187,11 @@ export default function ReportsPage() {
         </div>
         {!isReadOnly && (
           <button
-            onClick={() => generateReportMutation.mutate()}
+            onClick={() => generateReportMutation.mutate(undefined)}
             disabled={generateReportMutation.isPending}
             className="flex items-center gap-1.5 rounded-xl bg-blue-600 px-4 py-2.5 text-xs font-semibold text-white shadow-md shadow-blue-100 hover:bg-blue-700 transition-all disabled:opacity-50 active:scale-[0.98] dark:shadow-none"
           >
-            {generateReportMutation.isPending ? (
+            {generateReportMutation.isPending && !selectedReportId ? (
               <Loader2 className="h-3.5 w-3.5 animate-spin" />
             ) : (
               <Sparkles className="h-3.5 w-3.5" />
@@ -256,13 +296,24 @@ export default function ReportsPage() {
         {/* Left: Saved Digests List */}
         <div className="lg:col-span-4">
           <Card className="border border-slate-200 dark:border-white/[0.08] bg-card rounded-[18px]">
-            <CardHeader>
+            <CardHeader className="space-y-1 pb-4">
               <CardTitle className="text-sm font-bold text-slate-800 dark:text-slate-200">
                 Voice Digests
               </CardTitle>
               <CardDescription className="text-[11px]">
                 Historical synthesized workspace summaries.
               </CardDescription>
+              {/* Search Digests input */}
+              <div className="relative mt-2">
+                <Search className="absolute left-2.5 top-2 h-3.5 w-3.5 text-slate-400 dark:text-[#94A3B8]/60" />
+                <input
+                  type="text"
+                  placeholder="Search digests..."
+                  value={searchQuery}
+                  onChange={(e) => setSearchQuery(e.target.value)}
+                  className="w-full pl-8 pr-3 py-1.5 rounded-xl border border-slate-200 bg-slate-50 text-[11px] outline-none transition-all focus:border-blue-500 focus:ring-1 focus:ring-blue-100 dark:border-slate-800 dark:bg-slate-900/50 dark:focus:border-blue-600"
+                />
+              </div>
             </CardHeader>
             <CardContent className="p-0">
               {reportsLoading ? (
@@ -270,33 +321,57 @@ export default function ReportsPage() {
                   <Loader2 className="h-4 w-4 animate-spin mx-auto mb-2 text-blue-500" />
                   <span>Loading reports...</span>
                 </div>
-              ) : reports.length === 0 ? (
+              ) : filteredReports.length === 0 ? (
                 <div className="p-6 text-center text-xs text-slate-400">
-                  No digests synthesized yet.
+                  {searchQuery ? "No digests matching search criteria." : "No digests synthesized yet."}
                 </div>
               ) : (
                 <div className="divide-y divide-slate-100 dark:divide-white/[0.05]">
-                  {reports.map((report) => {
+                  {filteredReports.map((report) => {
                     const isSelected = report.id === selectedReportId || (!selectedReportId && report.id === reports[0].id);
                     return (
                       <div
                         key={report.id}
                         onClick={() => setSelectedReportId(report.id)}
-                        className={`p-4 flex items-start gap-3 cursor-pointer hover:bg-slate-50/50 dark:hover:bg-white/[0.01] transition-colors ${
+                        className={`p-4 flex items-center justify-between gap-3 cursor-pointer hover:bg-slate-50/50 dark:hover:bg-white/[0.01] transition-colors ${
                           isSelected ? "bg-blue-50/10 dark:bg-blue-950/10" : ""
                         }`}
                       >
-                        <div className="p-2 bg-blue-50/50 dark:bg-slate-900 rounded-lg text-blue-600 shrink-0">
-                          <FileText className="h-4 w-4" />
+                        <div className="flex items-start gap-3 min-w-0">
+                          <div className="p-2 bg-blue-50/50 dark:bg-slate-900 rounded-lg text-blue-600 shrink-0">
+                            <FileText className="h-4 w-4" />
+                          </div>
+                          <div className="min-w-0">
+                            <p className="text-xs font-semibold text-slate-800 dark:text-slate-200 truncate">
+                              {report.title}
+                            </p>
+                            <div className="flex items-center gap-1.5 mt-0.5">
+                              <p className="text-[9px] text-slate-400">
+                                {new Date(report.createdAt).toLocaleDateString()}
+                              </p>
+                              {report.status === "FAILED" && (
+                                <span className="text-[8px] bg-rose-500/10 text-rose-500 font-bold px-1.5 rounded-full">
+                                  FAILED
+                                </span>
+                              )}
+                            </div>
+                          </div>
                         </div>
-                        <div className="min-w-0">
-                          <p className="text-xs font-semibold text-slate-800 dark:text-slate-200 truncate">
-                            {report.title}
-                          </p>
-                          <p className="text-[9px] text-slate-400 mt-0.5">
-                            {new Date(report.createdAt).toLocaleDateString()}
-                          </p>
-                        </div>
+
+                        {!isReadOnly && (
+                          <button
+                            onClick={(e) => {
+                              e.stopPropagation();
+                              if (confirm("Are you sure you want to delete this VoC report?")) {
+                                deleteReportMutation.mutate(report.id);
+                              }
+                            }}
+                            className="p-1.5 text-slate-400 hover:text-rose-500 hover:bg-rose-50 dark:hover:bg-rose-950/20 rounded-lg transition-all"
+                            title="Delete Report"
+                          >
+                            <Trash2 className="h-3.5 w-3.5" />
+                          </button>
+                        )}
                       </div>
                     );
                   })}
@@ -310,24 +385,90 @@ export default function ReportsPage() {
         <div className="lg:col-span-8">
           {selectedReport ? (
             <Card className="border border-slate-200 dark:border-white/[0.08] bg-card rounded-[18px]">
-              <CardHeader className="flex flex-row justify-between items-center border-b border-slate-100 dark:border-white/[0.05] p-6">
-                <div>
-                  <CardTitle className="text-base font-bold text-slate-800 dark:text-[#F8FAFC]">
-                    {selectedReport.title}
-                  </CardTitle>
-                  <CardDescription className="text-xs text-slate-500 dark:text-[#94A3B8] flex items-center gap-1.5 mt-0.5">
-                    <Calendar className="h-3.5 w-3.5" />
-                    <span>Synthesized on {new Date(selectedReport.createdAt).toLocaleString()}</span>
-                  </CardDescription>
+              <CardHeader className="flex flex-col border-b border-slate-100 dark:border-white/[0.05] p-6">
+                <div className="flex flex-row justify-between items-start w-full">
+                  <div>
+                    <CardTitle className="text-base font-bold text-slate-800 dark:text-[#F8FAFC]">
+                      {selectedReport.title}
+                    </CardTitle>
+                    <CardDescription className="text-xs text-slate-500 dark:text-[#94A3B8] flex items-center gap-1.5 mt-1">
+                      <Calendar className="h-3.5 w-3.5" />
+                      <span>Synthesized on {new Date(selectedReport.createdAt).toLocaleString()}</span>
+                    </CardDescription>
+                  </div>
                 </div>
+
+                {/* Display detailed AI Metadata tracking bar */}
+                {selectedReport.status === "READY" && selectedReport.content?.metadata && (
+                  <div className="mt-4 flex flex-wrap gap-2 text-[9px] font-medium text-slate-500 dark:text-slate-400">
+                    <span className="bg-slate-100 dark:bg-slate-800/60 px-2 py-0.5 rounded-full">
+                      AI Provider: {selectedReport.content.metadata.provider || "Google Gemini"}
+                    </span>
+                    <span className="bg-slate-100 dark:bg-slate-800/60 px-2 py-0.5 rounded-full">
+                      Model: {selectedReport.content.metadata.modelName || "gemini-2.5-flash"}
+                    </span>
+                    <span className="bg-slate-100 dark:bg-slate-800/60 px-2 py-0.5 rounded-full">
+                      Latency: {selectedReport.content.metadata.processingTime || 0}ms
+                    </span>
+                    <span className="bg-slate-100 dark:bg-slate-800/60 px-2 py-0.5 rounded-full">
+                      Analyzed: {selectedReport.content.metadata.feedbackAnalyzed || 0} tickets
+                    </span>
+                    <span className="bg-slate-100 dark:bg-slate-800/60 px-2 py-0.5 rounded-full">
+                      Confidence: {selectedReport.content.confidence || 0}%
+                    </span>
+                  </div>
+                )}
               </CardHeader>
               <CardContent className="p-6">
-                <div
-                  className="prose prose-slate dark:prose-invert max-w-none space-y-4"
-                  dangerouslySetInnerHTML={{
-                    __html: formatMarkdown(selectedReport.content?.text || ""),
-                  }}
-                />
+                {selectedReport.status === "FAILED" || selectedReport.content?.errorType ? (
+                  <div className="flex flex-col items-center justify-center py-12 px-4 text-center">
+                    <div className="h-12 w-12 rounded-full bg-rose-500/10 text-rose-500 flex items-center justify-center mb-4">
+                      <Sparkles className="h-6 w-6" />
+                    </div>
+                    
+                    <h3 className="text-sm font-bold text-slate-800 dark:text-slate-200 mb-2">
+                      {selectedReport.content?.errorType === "NO_FEEDBACK"
+                        ? "No feedback data available"
+                        : selectedReport.content?.errorType === "GEMINI_QUOTA_EXCEEDED"
+                        ? "Gemini quota exceeded"
+                        : selectedReport.content?.errorType === "AI_UNAVAILABLE"
+                        ? "AI service unavailable"
+                        : "Report generation failed"}
+                    </h3>
+                    
+                    <p className="text-xs text-slate-500 dark:text-slate-400 max-w-md mb-6 leading-relaxed">
+                      {selectedReport.content?.errorType === "NO_FEEDBACK"
+                        ? "No feedback data available in this workspace. Please ingest customer tickets before synthesizing VoC insights."
+                        : selectedReport.content?.errorType === "GEMINI_QUOTA_EXCEEDED"
+                        ? "Google Gemini API returned a quota limit error (429 Rate Limit Exceeded). Please wait a moment before trying again."
+                        : selectedReport.content?.errorType === "AI_UNAVAILABLE"
+                        ? "The Gemini AI model is currently unreachable or could not be loaded. Please check your credentials configuration."
+                        : selectedReport.content?.errorMessage || "An unexpected error occurred while compiling the Voice-of-Customer narrative."}
+                    </p>
+
+                    {!isReadOnly && (
+                      <button
+                        onClick={() => generateReportMutation.mutate(selectedReport.id)}
+                        disabled={generateReportMutation.isPending}
+                        className="flex items-center gap-1.5 rounded-xl bg-blue-600 px-4 py-2.5 text-xs font-semibold text-white shadow-md shadow-blue-100 hover:bg-blue-700 transition-all disabled:opacity-50 active:scale-[0.98] dark:shadow-none"
+                      >
+                        {generateReportMutation.isPending && selectedReportId === selectedReport.id ? (
+                          <Loader2 className="h-3.5 w-3.5 animate-spin" />
+                        ) : (
+                          <Sparkles className="h-3.5 w-3.5" />
+                        )}
+                        <span>Retry Generation</span>
+                      </button>
+                    )}
+                  </div>
+                ) : (
+                  <div
+                    className="prose prose-slate dark:prose-invert max-w-none space-y-4"
+                    dangerouslySetInnerHTML={{
+                      __html: formatMarkdown(selectedReport.content?.text || ""),
+                    }}
+                  />
+                )}
               </CardContent>
             </Card>
           ) : (

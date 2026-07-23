@@ -1,6 +1,8 @@
 import { prisma } from "@/lib/prisma";
 import { FeedbackSource, Sentiment, WorkspaceRole, ReportStatus, Prisma } from "@prisma/client";
 import { AiService } from "./ai-service";
+import { AI_CONFIG } from "./ai-config";
+import { JobService } from "./job-service";
 
 export function getModelDisplayName(model: string | undefined): string {
   if (!model) return "Google Gemini AI";
@@ -52,6 +54,10 @@ export class DbService {
         ? (input.confidence > 1 ? input.confidence / 100 : input.confidence)
         : 0.85;
 
+      const normalizedSentiment = input.sentiment
+        ? (DbService.getNormalizedSentiment({ sentiment: input.sentiment }) as Sentiment)
+        : undefined;
+
       const timeline = [
         {
           type: "CREATED",
@@ -61,7 +67,7 @@ export class DbService {
         },
       ];
 
-      if (input.sentiment) {
+      if (normalizedSentiment) {
         timeline.push({
           type: "AI_CLASSIFIED",
           user: getModelDisplayName(input.modelVersion),
@@ -93,7 +99,7 @@ export class DbService {
         themes: input.themes || (input.theme ? [input.theme] : ["General"]),
         summary: input.summary || "No summary provided.",
         severity: input.severity || "MEDIUM",
-        sentiment: input.sentiment || "NEUTRAL",
+        sentiment: normalizedSentiment || "NEUTRAL",
         
         timeline,
       };
@@ -104,7 +110,7 @@ export class DbService {
           workspaceId,
           content: input.content,
           source: input.source,
-          sentiment: input.sentiment || null, // null indicates unclassified / queued
+          sentiment: normalizedSentiment || null, // null indicates unclassified / queued
           metadata: metadata as any,
           submittedAt: input.submittedAt || new Date(),
         },
@@ -383,90 +389,139 @@ export class DbService {
   }
 
   /**
-   * Batch triage queue processor. Avoids Gemini API duplicate requests.
+   * High-Performance Batch triage queue processor with Job Lifecycle tracking.
+   * Uses Gemini Batch requests, bulk deduplication, sub-batch chunking, and single-transaction bulk updates.
    */
-  static async triageBatchFeedbacks(workspaceId: string, limit = 5) {
-    const unclassified = await prisma.feedback.findMany({
-      where: {
-        workspaceId,
-        sentiment: null,
-      },
-      take: limit,
-    });
+  static async triageBatchFeedbacks(workspaceId: string, limit = 50, jobId?: string, retryFailedOnly = false) {
+    const totalStart = Date.now();
+    const retrievalStart = Date.now();
 
-    if (unclassified.length === 0) {
-      return { processed: 0, remaining: 0 };
+    if (jobId) {
+      JobService.updateJobProgress(jobId, { status: "PROCESSING", stage: "Fetching feedback" });
     }
 
-    let processedCount = 0;
+    // 1. Fetch unclassified or failed feedback items
+    const whereClause: Prisma.FeedbackWhereInput = { workspaceId };
 
-    for (const item of unclassified) {
-      const currentMeta = item.metadata as Record<string, any>;
+    if (retryFailedOnly) {
+      whereClause.metadata = {
+        path: ["triageState"],
+        equals: "FAILED",
+      };
+    } else {
+      whereClause.OR = [
+        { sentiment: null },
+        { metadata: { path: ["triageState"], equals: "FAILED" } },
+      ];
+    }
 
-      // Move queue state to processing
-      await prisma.feedback.update({
-        where: { id: item.id },
-        data: {
-          metadata: {
-            ...currentMeta,
-            triageState: "PROCESSING",
-          } as any,
-        },
-      });
+    const unclassified = await prisma.feedback.findMany({
+      where: whereClause,
+      take: limit,
+      orderBy: { submittedAt: "asc" },
+    });
 
-      try {
-        // A. Deduplication check: check if same content already exists
-        const duplicate = await prisma.feedback.findFirst({
-          where: {
-            workspaceId,
-            content: { equals: item.content, mode: "insensitive" },
-            sentiment: { not: null },
-          },
-          select: {
-            sentiment: true,
-            metadata: true,
-          },
+    const retrievalTimeMs = Date.now() - retrievalStart;
+
+    if (unclassified.length === 0) {
+      if (jobId) {
+        JobService.updateJobProgress(jobId, {
+          status: "COMPLETED",
+          stage: "Completed",
+          processedCount: 0,
+          remainingCount: 0,
         });
+      }
+      return {
+        processed: 0,
+        failed: 0,
+        remaining: 0,
+        totalInQueue: 0,
+        telemetry: {
+          modelName: AI_CONFIG.model,
+          processingTimeMs: Date.now() - totalStart,
+          retrievalTimeMs,
+          geminiTimeMs: 0,
+          dbWriteTimeMs: 0,
+          feedbackCount: 0,
+          successCount: 0,
+          failureCount: 0,
+          retryCount: 0,
+        },
+      };
+    }
 
-        let result;
-        let reused = false;
+    if (jobId) {
+      JobService.updateJobProgress(jobId, {
+        stage: "Preparing AI context",
+        totalCount: unclassified.length,
+        remainingCount: unclassified.length,
+      });
+    }
 
-        if (duplicate) {
-          const dupMeta = duplicate.metadata as Record<string, any>;
-          result = {
-            sentiment: duplicate.sentiment as Sentiment,
-            score: dupMeta.score || 5,
-            theme: dupMeta.theme || "General Feedback",
-            area: dupMeta.area || "General",
-            summary: dupMeta.summary || "Reused classification details.",
-            priority: dupMeta.priority || "MEDIUM",
-            confidence: dupMeta.confidence || 0.95,
-            promptVersion: dupMeta.promptVersion || "v1.1",
-            modelVersion: dupMeta.modelVersion || "reused-dedup",
-            
-            // New fields for duplicate reuse
-            themes: dupMeta.themes || [dupMeta.theme || "General Feedback"],
-            severity: dupMeta.severity || "MEDIUM",
-            processingTime: dupMeta.processingTime || 0,
-            provider: dupMeta.provider || "Google",
-          };
-          reused = true;
-        } else {
-          result = await AiService.classifyFeedback(item.content);
-        }
+    // 2. Bulk Deduplication Check across workspace
+    const uniqueContents = Array.from(new Set(unclassified.map((i) => i.content.toLowerCase().trim())));
+    const existingDuplicates = await prisma.feedback.findMany({
+      where: {
+        workspaceId,
+        sentiment: { not: null },
+        content: { in: uniqueContents, mode: "insensitive" },
+      },
+      select: {
+        content: true,
+        sentiment: true,
+        metadata: true,
+      },
+    });
 
-        const confidenceVal = result.confidence !== undefined
-          ? (result.confidence > 1 ? result.confidence / 100 : result.confidence)
-          : 0.85;
+    const duplicateMap = new Map<string, { sentiment: Sentiment; metadata: any }>();
+    for (const dup of existingDuplicates) {
+      const key = dup.content.toLowerCase().trim();
+      if (!duplicateMap.has(key)) {
+        duplicateMap.set(key, { sentiment: dup.sentiment as Sentiment, metadata: dup.metadata });
+      }
+    }
 
+    const itemsToClassifyWithAI: Array<{ id: string; content: string }> = [];
+    const itemsToUpdate: Array<{
+      id: string;
+      sentiment: Sentiment;
+      metadata: any;
+      themeName: string;
+      reused: boolean;
+    }> = [];
+
+    // Separate items into reused duplicates vs items requiring Gemini API call
+    for (const item of unclassified) {
+      const key = item.content.toLowerCase().trim();
+      const duplicate = duplicateMap.get(key);
+
+      if (duplicate) {
+        const dupMeta = duplicate.metadata as Record<string, any>;
+        const currentMeta = item.metadata as Record<string, any>;
+        const result = {
+          sentiment: duplicate.sentiment,
+          score: dupMeta.score || 5,
+          theme: dupMeta.theme || "General Feedback",
+          area: dupMeta.area || "General",
+          summary: dupMeta.summary || "Reused classification details.",
+          priority: dupMeta.priority || "MEDIUM",
+          confidence: dupMeta.confidence || 0.95,
+          promptVersion: dupMeta.promptVersion || "v1.1",
+          modelVersion: dupMeta.modelVersion || "reused-dedup",
+          themes: dupMeta.themes || [dupMeta.theme || "General Feedback"],
+          severity: dupMeta.severity || "MEDIUM",
+          processingTime: 0,
+          provider: dupMeta.provider || "Google",
+        };
+
+        const confidenceVal = result.confidence > 1 ? result.confidence / 100 : result.confidence;
         const timeline = [...(currentMeta.timeline || [])];
         timeline.push({
           type: "AI_CLASSIFIED",
           user: getModelDisplayName(result.modelVersion),
           timestamp: new Date().toISOString(),
-          description: reused
-            ? "Reused classification from duplicate item."
-            : `Auto-classified (Score: ${result.score}, Priority: ${result.priority}, Confidence: ${Math.round(confidenceVal * 100)}%)`,
+          description: "Reused classification from duplicate item.",
         });
 
         const updatedMetadata = {
@@ -478,81 +533,228 @@ export class DbService {
           confidence: confidenceVal,
           promptVersion: result.promptVersion,
           modelVersion: result.modelVersion,
-          
-          // Requirement 9 AI Metadata fields
-          model: result.modelVersion || "unknown",
-          provider: result.provider || "Google",
-          processingTime: result.processingTime || 0,
-          themes: result.themes || [result.theme],
+          model: result.modelVersion,
+          provider: result.provider,
+          processingTime: 0,
+          themes: result.themes,
           summary: result.summary,
-          severity: result.severity || "MEDIUM",
+          severity: result.severity,
           sentiment: result.sentiment,
-          
           triageState: "COMPLETED",
           status: currentMeta.status || "NEW",
           timeline,
         };
 
-        await prisma.$transaction(async (tx) => {
-          await tx.feedback.update({
-            where: { id: item.id },
-            data: {
-              sentiment: result.sentiment as Sentiment,
-              metadata: updatedMetadata as any,
-            },
-          });
+        itemsToUpdate.push({
+          id: item.id,
+          sentiment: result.sentiment,
+          metadata: updatedMetadata,
+          themeName: result.theme,
+          reused: true,
+        });
+      } else {
+        itemsToClassifyWithAI.push({ id: item.id, content: item.content });
+      }
+    }
 
-          // Link themes dynamically
-          const normalizedThemeName = result.theme.trim();
-          const theme = await tx.theme.upsert({
-            where: {
-              workspaceId_name: {
-                workspaceId,
-                name: normalizedThemeName,
-              },
-            },
-            update: {},
-            create: {
-              workspaceId,
-              name: normalizedThemeName,
-              description: `Auto-generated theme for ${normalizedThemeName}`,
-            },
-          });
+    let cumulativeGeminiTimeMs = 0;
+    let cumulativeRetryCount = 0;
+    let totalFailedCount = 0;
 
-          const existingLink = await tx.feedbackTheme.findUnique({
-            where: {
-              feedbackId_themeId: {
-                feedbackId: item.id,
-                themeId: theme.id,
-              },
-            },
-          });
+    // 3. Process items in sub-batches of 20 with Gemini API
+    if (jobId) {
+      JobService.updateJobProgress(jobId, { stage: "Gemini analysis" });
+    }
 
-          if (!existingLink) {
-            await tx.feedbackTheme.create({
-              data: {
-                feedbackId: item.id,
-                themeId: theme.id,
+    const chunkSize = 20;
+    for (let i = 0; i < itemsToClassifyWithAI.length; i += chunkSize) {
+      const chunk = itemsToClassifyWithAI.slice(i, i + chunkSize);
+      try {
+        const batchResponse = await AiService.classifyFeedbackBatch(chunk);
+        cumulativeGeminiTimeMs += batchResponse.telemetry.geminiTimeMs;
+        cumulativeRetryCount += batchResponse.telemetry.retryCount;
+
+        for (const reqItem of chunk) {
+          const originalItem = unclassified.find((u) => u.id === reqItem.id)!;
+          const currentMeta = originalItem.metadata as Record<string, any>;
+          const aiResult = batchResponse.results.get(reqItem.id);
+
+          if (aiResult) {
+            const confidenceVal = aiResult.confidence > 1 ? aiResult.confidence / 100 : aiResult.confidence;
+            const timeline = [...(currentMeta.timeline || [])];
+            timeline.push({
+              type: "AI_CLASSIFIED",
+              user: getModelDisplayName(aiResult.modelVersion),
+              timestamp: new Date().toISOString(),
+              description: `Auto-classified (Score: ${aiResult.score}, Priority: ${aiResult.priority}, Confidence: ${Math.round(confidenceVal * 100)}%)`,
+            });
+
+            // Clean up stale error metadata if retried item succeeds
+            const { triageError, triageErrorDetail, ...cleanMeta } = currentMeta;
+            const updatedMetadata = {
+              ...cleanMeta,
+              score: aiResult.score,
+              area: aiResult.area,
+              theme: aiResult.theme,
+              priority: aiResult.priority,
+              confidence: confidenceVal,
+              promptVersion: aiResult.promptVersion,
+              modelVersion: aiResult.modelVersion,
+              model: aiResult.modelVersion,
+              provider: aiResult.provider,
+              processingTime: batchResponse.telemetry.processingTimeMs,
+              themes: aiResult.themes,
+              summary: aiResult.summary,
+              severity: aiResult.severity,
+              sentiment: aiResult.sentiment,
+              triageState: "COMPLETED",
+              status: currentMeta.status || "NEW",
+              timeline,
+            };
+
+            itemsToUpdate.push({
+              id: originalItem.id,
+              sentiment: aiResult.sentiment as Sentiment,
+              metadata: updatedMetadata,
+              themeName: aiResult.theme,
+              reused: false,
+            });
+          } else {
+            totalFailedCount++;
+            const customerName = currentMeta.customerName || "Anonymous User";
+            const errorMsg = "Missing AI classification result";
+            itemsToUpdate.push({
+              id: originalItem.id,
+              sentiment: null as any,
+              metadata: {
+                ...currentMeta,
+                triageState: "FAILED",
+                triageError: `${customerName} failed: ${errorMsg}`,
+                triageErrorDetail: {
+                  feedbackId: originalItem.id,
+                  customerName,
+                  customerEmail: currentMeta.customerEmail || "",
+                  errorMessage: errorMsg,
+                  timestamp: new Date().toISOString(),
+                },
               },
+              themeName: "",
+              reused: false,
             });
           }
-        });
+        }
+      } catch (chunkError: any) {
+        console.error(`Sub-batch of ${chunk.length} items failed:`, chunkError?.message || chunkError);
+        totalFailedCount += chunk.length;
 
-        processedCount++;
-      } catch (err: any) {
-        console.error(`Batch triage item processing failure for feedback ID ${item.id}:`, err);
-        await prisma.feedback.update({
-          where: { id: item.id },
-          data: {
+        for (const reqItem of chunk) {
+          const originalItem = unclassified.find((u) => u.id === reqItem.id)!;
+          const currentMeta = originalItem.metadata as Record<string, any>;
+          const customerName = currentMeta.customerName || "Anonymous User";
+          const errorMsg = chunkError?.message || "Sub-batch AI request failed";
+
+          itemsToUpdate.push({
+            id: originalItem.id,
+            sentiment: null as any,
             metadata: {
               ...currentMeta,
               triageState: "FAILED",
-              triageError: err?.message || String(err),
-            } as any,
-          },
+              triageError: `${customerName} failed: ${errorMsg}`,
+              triageErrorDetail: {
+                feedbackId: originalItem.id,
+                customerName,
+                customerEmail: currentMeta.customerEmail || "",
+                errorMessage: errorMsg,
+                timestamp: new Date().toISOString(),
+              },
+            },
+            themeName: "",
+            reused: false,
+          });
+        }
+      }
+
+      if (jobId) {
+        const currentProcessed = itemsToUpdate.filter((i) => i.metadata.triageState === "COMPLETED").length;
+        JobService.updateJobProgress(jobId, {
+          processedCount: currentProcessed,
+          failedCount: totalFailedCount,
+          remainingCount: Math.max(0, unclassified.length - (currentProcessed + totalFailedCount)),
         });
       }
     }
+
+    // 4. Bulk Database Operations
+    if (jobId) {
+      JobService.updateJobProgress(jobId, { stage: "Saving results" });
+    }
+    const dbWriteStart = Date.now();
+
+    // A. Collect unique non-empty themes and bulk upsert them
+    const uniqueThemeNames = Array.from(
+      new Set(itemsToUpdate.map((i) => i.themeName).filter((t) => t && t.trim().length > 0))
+    );
+
+    const themeMap = new Map<string, string>(); // themeName -> themeId
+    if (uniqueThemeNames.length > 0) {
+      const existingThemes = await prisma.theme.findMany({
+        where: {
+          workspaceId,
+          name: { in: uniqueThemeNames },
+        },
+      });
+
+      for (const t of existingThemes) {
+        themeMap.set(t.name, t.id);
+      }
+
+      const missingThemeNames = uniqueThemeNames.filter((name) => !themeMap.has(name));
+      for (const missingName of missingThemeNames) {
+        const createdTheme = await prisma.theme.upsert({
+          where: { workspaceId_name: { workspaceId, name: missingName } },
+          update: {},
+          create: {
+            workspaceId,
+            name: missingName,
+            description: `Auto-generated theme for ${missingName}`,
+          },
+        });
+        themeMap.set(missingName, createdTheme.id);
+      }
+    }
+
+    // B. Group feedback updates and theme links in a single $transaction
+    const feedbackThemeLinks: Array<{ feedbackId: string; themeId: string }> = [];
+
+    const dbOperations = itemsToUpdate.map((item) => {
+      if (item.themeName && themeMap.has(item.themeName)) {
+        feedbackThemeLinks.push({
+          feedbackId: item.id,
+          themeId: themeMap.get(item.themeName)!,
+        });
+      }
+
+      return prisma.feedback.update({
+        where: { id: item.id },
+        data: {
+          sentiment: item.sentiment,
+          metadata: item.metadata,
+        },
+      });
+    });
+
+    await prisma.$transaction(dbOperations);
+
+    // C. Bulk create theme links
+    if (feedbackThemeLinks.length > 0) {
+      await prisma.feedbackTheme.createMany({
+        data: feedbackThemeLinks,
+        skipDuplicates: true,
+      });
+    }
+
+    const dbWriteTimeMs = Date.now() - dbWriteStart;
+    const totalDurationMs = Date.now() - totalStart;
 
     const remainingCount = await prisma.feedback.count({
       where: {
@@ -561,36 +763,121 @@ export class DbService {
       },
     });
 
-    return { processed: processedCount, remaining: remainingCount };
+    const successCount = itemsToUpdate.filter((i) => i.metadata.triageState === "COMPLETED").length;
+    const failedItems = itemsToUpdate.filter((i) => i.metadata.triageState === "FAILED");
+    const failedItemIds = failedItems.map((i) => i.id);
+    const failedDetails = failedItems.map((i) => ({
+      id: i.id,
+      customerName: i.metadata.customerName || "Anonymous User",
+      errorMessage: i.metadata.triageError || "Classification failed",
+    }));
+
+    const telemetry = {
+      modelName: AI_CONFIG.model,
+      processingTimeMs: totalDurationMs,
+      retrievalTimeMs,
+      geminiTimeMs: cumulativeGeminiTimeMs,
+      dbWriteTimeMs,
+      feedbackCount: unclassified.length,
+      successCount,
+      failureCount: totalFailedCount,
+      retryCount: cumulativeRetryCount,
+      apiCallCount: Math.ceil(itemsToClassifyWithAI.length / 20),
+    };
+
+    if (jobId) {
+      JobService.updateJobProgress(jobId, {
+        status: totalFailedCount > 0 && successCount === 0 ? "FAILED" : "COMPLETED",
+        stage: "Completed",
+        processedCount: successCount,
+        failedCount: totalFailedCount,
+        remainingCount,
+        completedAt: new Date().toISOString(),
+        failedItemIds,
+        failedDetails,
+        telemetry,
+        error: totalFailedCount > 0 ? `${totalFailedCount} items failed processing.` : undefined,
+      });
+    }
+
+    return {
+      processed: successCount,
+      failed: totalFailedCount,
+      remaining: remainingCount,
+      totalInQueue: unclassified.length,
+      failedDetails,
+      telemetry,
+    };
+  }
+
+  /**
+   * Helper to normalize sentiment string values
+   */
+  static getNormalizedSentiment(f: any): string | null {
+    const s = f.sentiment || (f.metadata as any)?.sentiment;
+    if (!s) return null;
+    const upper = String(s).toUpperCase().trim();
+    if (upper === "POSITIVE") return "POSITIVE";
+    if (upper === "NEGATIVE") return "NEGATIVE";
+    if (upper === "NEUTRAL") return "NEUTRAL";
+    return null;
   }
 
   /**
    * Get overview dashboard stats
    */
   static async getOverviewStats(workspaceId: string) {
-    const totalCount = await prisma.feedback.count({ where: { workspaceId } });
-
-    const positiveCount = await prisma.feedback.count({
-      where: { workspaceId, sentiment: "POSITIVE" },
-    });
-    const neutralCount = await prisma.feedback.count({
-      where: { workspaceId, sentiment: "NEUTRAL" },
-    });
-    const avgSentiment = totalCount > 0 ? Math.round(((positiveCount + neutralCount * 0.5) / totalCount) * 100) : 0;
-
     const feedbacks = await prisma.feedback.findMany({
       where: { workspaceId },
-      select: { source: true, sentiment: true, metadata: true, submittedAt: true },
+      select: { id: true, source: true, sentiment: true, metadata: true, submittedAt: true, createdAt: true },
     });
-    const openIssues = feedbacks.filter((f: any) => {
-      const meta = f.metadata as Record<string, any>;
-      return !meta.status || meta.status === "NEW";
+
+    let positiveCount = 0;
+    let negativeCount = 0;
+    let neutralCount = 0;
+
+    feedbacks.forEach((f: any) => {
+      const norm = DbService.getNormalizedSentiment(f);
+      if (norm === "POSITIVE") positiveCount++;
+      else if (norm === "NEGATIVE") negativeCount++;
+      else if (norm === "NEUTRAL") neutralCount++;
+    });
+
+    const totalFeedback = feedbacks.length;
+    const avgSentimentVal = totalFeedback > 0 ? Math.round((positiveCount / totalFeedback) * 100) : 0;
+    const avgSentiment = `${avgSentimentVal}%`;
+
+    const activeIssuesCount = feedbacks.filter((f: any) => {
+      const normSentiment = DbService.getNormalizedSentiment(f);
+      const severity = String((f.metadata as any)?.severity || (f.metadata as any)?.priority || "").toUpperCase().trim();
+      return normSentiment === "NEGATIVE" || severity === "HIGH" || severity === "CRITICAL";
     }).length;
 
-    const churnRiskCount = feedbacks.filter((f: any) => {
-      const meta = f.metadata as Record<string, any>;
-      return meta.customerLabel === "churn_risk";
+    // Calculate Churn Risk Ratio
+    const negativeSentimentPct = totalFeedback > 0 ? (negativeCount / totalFeedback) : 0;
+
+    const highSeverityCount = feedbacks.filter((f: any) => {
+      const severity = String((f.metadata as any)?.severity || (f.metadata as any)?.priority || "").toUpperCase().trim();
+      return severity === "HIGH" || severity === "CRITICAL";
     }).length;
+    const highSeverityPct = totalFeedback > 0 ? (highSeverityCount / totalFeedback) : 0;
+
+    const customerEmailCounts: Record<string, number> = {};
+    feedbacks.forEach((f: any) => {
+      const email = (f.metadata as any)?.customerEmail;
+      if (email && email !== "anonymous@company.com") {
+        customerEmailCounts[email] = (customerEmailCounts[email] || 0) + 1;
+      }
+    });
+
+    const repeatedComplaintsCount = feedbacks.filter((f: any) => {
+      const email = (f.metadata as any)?.customerEmail;
+      return email && email !== "anonymous@company.com" && customerEmailCounts[email] > 1;
+    }).length;
+    const repeatedPct = totalFeedback > 0 ? (repeatedComplaintsCount / totalFeedback) : 0;
+
+    const churnRiskVal = Math.min(100, Math.round(((negativeSentimentPct * 0.4) + (highSeverityPct * 0.4) + (repeatedPct * 0.2) ) * 100));
+    const churnRisk = `${churnRiskVal}%`;
 
     // A. Priority Counts
     const priorityDistribution = { HIGH: 0, MEDIUM: 0, LOW: 0 };
@@ -624,16 +911,18 @@ export class DbService {
     let lastMonthPositive = 0;
 
     feedbacks.forEach((f: any) => {
-      const date = new Date(f.submittedAt);
+      const date = new Date(f.submittedAt || f.createdAt);
       const m = date.getMonth();
       const y = date.getFullYear();
 
       if (m === currentMonth && y === currentYear) {
         currentMonthVolume += 1;
-        if (f.sentiment === "POSITIVE") currentMonthPositive += 1;
+        const norm = DbService.getNormalizedSentiment(f);
+        if (norm === "POSITIVE") currentMonthPositive += 1;
       } else if (m === lastMonth && y === lastMonthYear) {
         lastMonthVolume += 1;
-        if (f.sentiment === "POSITIVE") lastMonthPositive += 1;
+        const norm = DbService.getNormalizedSentiment(f);
+        if (norm === "POSITIVE") lastMonthPositive += 1;
       }
     });
 
@@ -645,11 +934,33 @@ export class DbService {
     const lastSentimentPct = lastMonthVolume > 0 ? Math.round((lastMonthPositive / lastMonthVolume) * 100) : 0;
     const sentimentMoM = currentSentimentPct - lastSentimentPct;
 
+    // Backend logging for dashboard stats retrieval
+    console.log(
+      JSON.stringify({
+        event: "DASHBOARD_STATS_RETRIEVED_BACKEND",
+        workspaceId,
+        totalFeedback,
+        sentimentCounts: {
+          positive: positiveCount,
+          negative: negativeCount,
+          neutral: neutralCount,
+        },
+        priorityDistribution,
+        channelDistribution,
+        activeIssuesCount,
+        churnRisk,
+        timestamp: new Date().toISOString(),
+      })
+    );
+
     return {
-      totalFeedback: totalCount,
-      avgSentiment: `${avgSentiment}%`,
-      openIssues,
-      churnRisk: `${totalCount > 0 ? Math.round((churnRiskCount / totalCount) * 1000) / 10 : 0}%`,
+      totalFeedback,
+      positiveCount,
+      negativeCount,
+      neutralCount,
+      avgSentiment,
+      openIssues: activeIssuesCount,
+      churnRisk,
       priorityDistribution,
       channelDistribution,
       trendComparison: {
@@ -673,7 +984,7 @@ export class DbService {
   }
 
   /**
-   * Get top topics driving negative feedback
+   * Get top topics driving feedback analytics (minimum 5 themes)
    */
   static async getNegativeTopics(workspaceId: string, limit = 5) {
     const themes = await prisma.theme.findMany({
@@ -687,20 +998,22 @@ export class DbService {
       },
     });
 
+    const targetLimit = Math.max(5, limit);
+
     const topicStats = themes
       .map((t) => {
-        const negativeFeedbacks = t.feedback.filter((ft) => ft.feedback.sentiment === "NEGATIVE").length;
+        const negativeFeedbacks = t.feedback.filter((ft) => DbService.getNormalizedSentiment(ft.feedback) === "NEGATIVE").length;
         const totalFeedbacks = t.feedback.length;
         const ratio = totalFeedbacks > 0 ? Math.round((negativeFeedbacks / totalFeedbacks) * 100) : 0;
         return {
           name: t.name,
           ratio,
-          count: negativeFeedbacks,
+          count: negativeFeedbacks > 0 ? negativeFeedbacks : totalFeedbacks,
         };
       })
       .filter((t) => t.count > 0)
       .sort((a, b) => b.count - a.count)
-      .slice(0, limit);
+      .slice(0, targetLimit);
 
     return topicStats;
   }
@@ -711,27 +1024,31 @@ export class DbService {
   static async getAnalyticsCharts(workspaceId: string) {
     const feedbacks = await prisma.feedback.findMany({
       where: { workspaceId },
-      select: { sentiment: true, submittedAt: true },
-      orderBy: { submittedAt: "asc" },
+      select: { sentiment: true, submittedAt: true, createdAt: true, metadata: true },
+      orderBy: { createdAt: "asc" },
     });
 
-    const months = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"];
-    const monthlyStats: Record<string, { name: string; count: number; positive: number }> = {};
+    const dailyStats: Record<string, { date: string; total: number; positive: number; negative: number; neutral: number }> = {};
 
     feedbacks.forEach((f) => {
-      const monthIndex = new Date(f.submittedAt).getMonth();
-      const monthName = months[monthIndex];
-      if (!monthlyStats[monthName]) {
-        monthlyStats[monthName] = { name: monthName, count: 0, positive: 0 };
+      const dateStr = new Date(f.createdAt || f.submittedAt).toISOString().split("T")[0];
+      if (!dailyStats[dateStr]) {
+        dailyStats[dateStr] = { date: dateStr, total: 0, positive: 0, negative: 0, neutral: 0 };
       }
-      monthlyStats[monthName].count += 1;
-      if (f.sentiment === "POSITIVE") {
-        monthlyStats[monthName].positive += 1;
+      dailyStats[dateStr].total += 1;
+
+      const norm = DbService.getNormalizedSentiment(f);
+      if (norm === "POSITIVE") {
+        dailyStats[dateStr].positive += 1;
+      } else if (norm === "NEGATIVE") {
+        dailyStats[dateStr].negative += 1;
+      } else if (norm === "NEUTRAL") {
+        dailyStats[dateStr].neutral += 1;
       }
     });
 
-    const data = Object.values(monthlyStats);
-    return data.length > 0 ? data : [{ name: "Jul", count: 12, positive: 8 }];
+    const data = Object.values(dailyStats);
+    return data.length > 0 ? data : [{ date: new Date().toISOString().split("T")[0], total: 0, positive: 0, negative: 0, neutral: 0 }];
   }
 
   /**

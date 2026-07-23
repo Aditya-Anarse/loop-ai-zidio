@@ -7,3 +7,4 @@ generated
 *.tsbuildinfo
 .pnpm-store/
 .pnpm-store
+.triage-jobs.json
