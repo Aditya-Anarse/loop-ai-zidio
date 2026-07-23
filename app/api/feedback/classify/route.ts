@@ -2,6 +2,7 @@ import { NextResponse } from "next/server";
 import { requireApiWorkspaceContext, ApiAuthError, ApiForbiddenError } from "@/services/auth/authorization";
 import { AiService } from "@/lib/services/ai-service";
 import { DbService } from "@/lib/services/db-service";
+import { WebhookService } from "@/lib/services/webhook-service";
 import { prisma } from "@/lib/prisma";
 
 export async function POST(request: Request) {
@@ -89,6 +90,33 @@ export async function POST(request: Request) {
       },
       reused ? "System Ingestion (Deduplicated)" : "System Ingestion"
     );
+
+    // 4. Trigger Asynchronous Integration Events (Non-blocking guarantee)
+    const eventPayload = {
+      feedbackId: feedback.id,
+      customerName: customerName || "Anonymous User",
+      customerEmail: customerEmail || "",
+      feedback: content,
+      sentiment: classification.sentiment,
+      severity: classification.severity || "MEDIUM",
+      priority: classification.priority || "MEDIUM",
+      theme: classification.theme || "General",
+      createdAt: feedback.createdAt.toISOString(),
+    };
+
+    void WebhookService.queueEvent(workspaceId, "FEEDBACK_CREATED", feedback.id, eventPayload);
+    void WebhookService.queueEvent(workspaceId, "AI_CLASSIFIED", feedback.id, eventPayload);
+
+    const isHighPriority =
+      classification.severity === "HIGH" ||
+      classification.severity === "CRITICAL" ||
+      classification.priority === "HIGH" ||
+      classification.priority === "URGENT" ||
+      (classification.sentiment === "NEGATIVE" && classification.severity !== "LOW");
+
+    if (isHighPriority) {
+      void WebhookService.queueEvent(workspaceId, "HIGH_PRIORITY_FEEDBACK", feedback.id, eventPayload);
+    }
 
     return NextResponse.json({ success: true, feedback }, { status: 201 });
   } catch (error: any) {

@@ -3,6 +3,7 @@ import { FeedbackSource, Sentiment, WorkspaceRole, ReportStatus, Prisma } from "
 import { AiService } from "./ai-service";
 import { AI_CONFIG } from "./ai-config";
 import { JobService } from "./job-service";
+import { WebhookService } from "./webhook-service";
 
 export function getModelDisplayName(model: string | undefined): string {
   if (!model) return "Google Gemini AI";
@@ -744,6 +745,37 @@ export class DbService {
     });
 
     await prisma.$transaction(dbOperations);
+
+    // Queue integration events asynchronously for successfully classified items
+    for (const item of itemsToUpdate) {
+      if (item.metadata && item.metadata.triageState === "COMPLETED") {
+        const original = unclassified.find((u) => u.id === item.id);
+        const eventData = {
+          feedbackId: item.id,
+          customerName: item.metadata.customerName || "Anonymous User",
+          customerEmail: item.metadata.customerEmail || "",
+          feedback: original?.content || "",
+          sentiment: item.sentiment,
+          severity: item.metadata.severity || "MEDIUM",
+          priority: item.metadata.priority || "MEDIUM",
+          theme: item.themeName || "General",
+          createdAt: original?.createdAt?.toISOString() || new Date().toISOString(),
+        };
+
+        void WebhookService.queueEvent(workspaceId, "AI_CLASSIFIED", item.id, eventData);
+
+        const isHighPriority =
+          item.metadata.severity === "HIGH" ||
+          item.metadata.severity === "CRITICAL" ||
+          item.metadata.priority === "HIGH" ||
+          item.metadata.priority === "URGENT" ||
+          (item.sentiment === "NEGATIVE" && item.metadata.severity !== "LOW");
+
+        if (isHighPriority) {
+          void WebhookService.queueEvent(workspaceId, "HIGH_PRIORITY_FEEDBACK", item.id, eventData);
+        }
+      }
+    }
 
     // C. Bulk create theme links
     if (feedbackThemeLinks.length > 0) {
